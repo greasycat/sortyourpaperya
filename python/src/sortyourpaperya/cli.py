@@ -340,7 +340,8 @@ def retag(
 
     With a category, it is applied. Without one the model is asked where the
     document belongs and nothing is written until you accept — which is the way
-    back from a label that steering got wrong.
+    back from a label that steering got wrong. Each round you may say what the
+    model is missing, and it answers again knowing it.
     """
     if category is None:
         _retag_by_asking(file_id, library_dir, model)
@@ -390,6 +391,11 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
         typer.echo(f"  now:        {' / '.join(paper.tags) or '-'}")
 
         rejected: list[str] = []
+        # What the person last said about this document. The latest replaces
+        # the one before it rather than piling up: someone correcting their own
+        # steer — "no, the hardware side" — means the newer sentence, and two
+        # contradictory instructions in one prompt are worth less than either.
+        guidance = ""
         while True:
             try:
                 suggestion = asyncio.run(
@@ -400,6 +406,7 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
                         page_cutoff=settings.page_cutoff,
                         existing_categories=steering,
                         rejected=rejected,
+                        guidance=guidance,
                     )
                 )
             except LlmError as err:
@@ -421,8 +428,12 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
             )
             if suggestion.keywords:
                 typer.echo(f"  keywords:   {', '.join(suggestion.keywords)}")
+            if guidance:
+                # Named alongside the answer it produced, so a suggestion that
+                # ignored what you said is visibly that rather than a mystery.
+                typer.echo(f"  asked for:  {guidance}")
 
-            choice = _ask_what_to_do()
+            choice, direction = _ask_what_to_do()
             if choice == "accept":
                 with Library(settings.output_dir) as writable:
                     _apply_retag(
@@ -432,32 +443,52 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
             if choice == "cancel":
                 typer.echo("nothing changed")
                 return
+            if direction:
+                guidance = direction
             rejected.append(suggestion.category)
 
 
-def _ask_what_to_do() -> str:
-    """Accept, regenerate, or cancel.
+def _ask_what_to_do() -> tuple[str, str]:
+    """Accept, say what the model is missing, ask again, or cancel.
 
-    An end of input is a cancel rather than a crash, so running this with no one
-    at the keyboard — from cron, or with stdin closed — stops cleanly instead of
-    failing with a traceback.
+    Returns the choice and, when one was given, the direction to ask under.
+    Steering is read here rather than by the caller because an empty answer is
+    not a decision: the menu comes back, and no request has been spent.
     """
     while True:
-        try:
-            answer = typer.prompt("[a]ccept, [r]egenerate, [c]ancel", default="a")
-        except (typer.Abort, EOFError):
-            # Typer vendors click, so its re-export is the one public name for
-            # the exception a closed stdin raises.
-            typer.echo("\ncancelled; nothing changed")
-            raise typer.Exit(code=0) from None
+        answer = _prompt("[a]ccept, [s]teer, [r]egenerate, [c]ancel", default="a")
         first = answer.strip()[:1].lower()
         if first == "a":
-            return "accept"
+            return "accept", ""
         if first == "r":
-            return "regenerate"
+            return "regenerate", ""
         if first == "c":
-            return "cancel"
-        typer.echo("  please answer a, r, or c", err=True)
+            return "cancel", ""
+        if first == "s":
+            # A steer is a re-ask that carries a sentence, so the caller has
+            # nothing extra to handle: it regenerates either way.
+            direction = _prompt(
+                "  what is it about, or where should it go?", default=""
+            ).strip()
+            if direction:
+                return "regenerate", direction
+            continue
+        typer.echo("  please answer a, s, r, or c", err=True)
+
+
+def _prompt(text: str, default: str = "") -> str:
+    """Ask a question, treating an end of input as a cancel rather than a crash.
+
+    Running this with no one at the keyboard — from cron, or with stdin closed
+    — stops cleanly instead of failing with a traceback.
+    """
+    try:
+        return typer.prompt(text, default=default)
+    except (typer.Abort, EOFError):
+        # Typer vendors click, so its re-export is the one public name for
+        # the exception a closed stdin raises.
+        typer.echo("\ncancelled; nothing changed")
+        raise typer.Exit(code=0) from None
 
 
 @app.command()

@@ -21,6 +21,7 @@ class SuggestionCall:
     current: str
     existing_categories: list[str]
     rejected: list[str]
+    guidance: str
 
 
 class FakeLlmClient:
@@ -78,6 +79,7 @@ class FakeLlmClient:
         current: str = "",
         existing_categories: Sequence[str] = (),
         rejected: Sequence[str] = (),
+        guidance: str = "",
     ) -> CategorySuggestion:
         """Answer a re-ask, never repeating one that was turned down.
 
@@ -91,6 +93,7 @@ class FakeLlmClient:
                 current=current,
                 existing_categories=list(existing_categories),
                 rejected=list(rejected),
+                guidance=guidance,
             )
         )
         offered = [c for c in self.categories if c not in set(rejected)]

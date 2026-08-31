@@ -335,6 +335,50 @@ def test_regenerating_never_offers_the_same_category_twice(library) -> None:
     ]
 
 
+def test_a_steer_is_carried_into_the_next_suggestion(library) -> None:
+    """Refusing says only "not that". Someone who has read the document knows more."""
+    root = _misfiled(library)
+    fake = FakeLlmClient()
+
+    result = _retag(
+        root, fake, "78c64b3b8ef6", input="s\nit is about the maths, not the clinic\na\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(fake.suggestions) == 2
+    assert fake.suggestions[0].guidance == ""
+    assert fake.suggestions[1].guidance == "it is about the maths, not the clinic"
+    assert fake.suggestions[1].rejected == ["Cognitive Science/Computational Modelling"], (
+        "a steer is still a refusal of what was on screen"
+    )
+    assert "it is about the maths" in result.output, "shown with the answer it produced"
+
+
+def test_a_later_steer_replaces_the_one_before_it(library) -> None:
+    """Someone correcting their own instruction means the newer sentence."""
+    root = _misfiled(library)
+    fake = FakeLlmClient()
+
+    _retag(root, fake, "78c64b3b8ef6", input="s\nthe maths\ns\nno, the hardware\nc\n")
+
+    assert [call.guidance for call in fake.suggestions] == [
+        "",
+        "the maths",
+        "no, the hardware",
+    ]
+
+
+def test_saying_nothing_at_the_steer_prompt_costs_no_request(library) -> None:
+    """An empty answer is not a decision, so the menu comes back."""
+    root = _misfiled(library)
+    fake = FakeLlmClient()
+
+    result = _retag(root, fake, "78c64b3b8ef6", input="s\n\nc\n")
+
+    assert result.exit_code == 0, result.output
+    assert len(fake.suggestions) == 1, "nothing was asked again"
+
+
 def test_the_model_is_told_where_the_document_sits_now(library) -> None:
     root = _misfiled(library)
     fake = FakeLlmClient()

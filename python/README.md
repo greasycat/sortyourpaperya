@@ -289,14 +289,32 @@ it. Without one it asks the model where the document belongs:
 suggestion 1: Cognitive Science / Computational Modelling
   keywords:   successor representations, temporal difference learning, …
 
-[a]ccept, [r]egenerate, [c]ancel [a]:
+[a]ccept, [s]teer, [r]egenerate, [c]ancel [a]:
 ```
 
 `r` asks again, and each round is told every category already turned down — so
 the model has to reconsider rather than reword. Without that the inputs would be
-identical each time and the answer would be too. There is no cap on how many
-times you may ask; each one is a request, numbered on screen so the count is
-visible, and the daily ceiling is what bounds it.
+identical each time and the answer would be too.
+
+`s` is for when refusing is not enough. It asks for a sentence — "it is about
+the maths, not the clinic", "file it near the tax papers" — and the next round
+is asked under it:
+
+```
+[a]ccept, [s]teer, [r]egenerate, [c]ancel [a]: s
+  what is it about, or where should it go?: it is about the maths, not the clinic
+
+suggestion 2: Mathematics / Probability
+  keywords:   markov decision processes, temporal difference learning, …
+  asked for:  it is about the maths, not the clinic
+```
+
+You are the one who has read the document, so what you say outranks everything
+else in the prompt, the rejected list included — a steer that walks back a path
+you turned down two rounds ago is allowed to. Saying it again replaces it
+rather than piling up; an empty answer costs nothing and brings the menu back.
+There is no cap on how many times you may ask; each one is a request, numbered
+on screen so the count is visible, and the daily ceiling is what bounds it.
 
 Accepting replaces the tags **and** the keywords, in one transaction, since
 taking the model's category and keeping its old keywords would describe the
