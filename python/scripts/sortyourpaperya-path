@@ -9,9 +9,10 @@
 #
 # `wire` builds a virtualenv beside the project, installs the package into it
 # in editable mode so edits take effect without reinstalling, and symlinks the
-# resulting `sortyourpaperya` into a directory on PATH. Dependencies come from
-# requirements.lock, so two machines set up months apart get the same versions;
-# `relock` is how that file is deliberately moved forward.
+# commands it installs — `sortyourpaperya` and its short name `sypy` — into a
+# directory on PATH. Dependencies come from requirements.lock, so two machines
+# set up months apart get the same versions; `relock` is how that file is
+# deliberately moved forward.
 #
 # It also links the agent skill into the skills directory, since a skill an
 # agent cannot find is no more use than a command that is not on PATH. Both are
@@ -25,8 +26,13 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${SORTYOURPAPERYA_VENV_DIR:-$PROJECT_DIR/.venv}"
 BIN_DIR="${SORTYOURPAPERYA_BIN_DIR:-$HOME/.local/bin}"
-LINK="$BIN_DIR/sortyourpaperya"
 LOCK_FILE="$PROJECT_DIR/requirements.lock"
+
+# The command names the package installs, and so the links this puts on PATH.
+# Both run the same entry point; `sypy` is the short one, and it is a link
+# rather than a shell alias so that anything which is not an interactive shell —
+# a script, a supervisor, an agent — can reach it too.
+COMMANDS="sortyourpaperya sypy"
 
 # The agent skill, and where an agent looks for one. Claude Code reads
 # ~/.claude/skills; SORTYOURPAPERYA_SKILLS_DIR says so for anything else.
@@ -38,11 +44,12 @@ SKILL_LINK="$SKILLS_DIR/$SKILL_NAME"
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 note() { printf '%s\n' "$1"; }
 
-# Whether $LINK is a symlink this script created, rather than some other sortyourpaperya
+# Whether a link is one this script created, rather than some other command
 # that happens to share the name. Everything destructive checks this first.
 links_into_venv() {
-  [ -L "$LINK" ] || return 1
-  case "$(readlink "$LINK")" in
+  local link="$1"
+  [ -L "$link" ] || return 1
+  case "$(readlink "$link")" in
     "$VENV_DIR"/*) return 0 ;;
     *) return 1 ;;
   esac
@@ -107,9 +114,13 @@ wire() {
     || die "$python is older than 3.11, which this package requires"
 
   # Checked before installing anything, so a name clash costs nothing.
-  if { [ -e "$LINK" ] || [ -L "$LINK" ]; } && ! links_into_venv; then
-    die "$LINK already exists and was not created by this script; remove it first"
-  fi
+  local command link
+  for command in $COMMANDS; do
+    link="$BIN_DIR/$command"
+    if { [ -e "$link" ] || [ -L "$link" ]; } && ! links_into_venv "$link"; then
+      die "$link already exists and was not created by this script; remove it first"
+    fi
+  done
 
   if [ ! -x "$VENV_DIR/bin/python" ]; then
     note "creating virtualenv at $VENV_DIR"
@@ -133,12 +144,15 @@ wire() {
     "$VENV_DIR/bin/python" -m pip install --quiet --editable "$PROJECT_DIR"
   fi
 
-  [ -x "$VENV_DIR/bin/sortyourpaperya" ] || die "install finished but $VENV_DIR/bin/sortyourpaperya is missing"
-
-  rm -f "$LINK"
   mkdir -p "$BIN_DIR"
-  ln -s "$VENV_DIR/bin/sortyourpaperya" "$LINK"
-  note "wired $LINK -> $VENV_DIR/bin/sortyourpaperya"
+  for command in $COMMANDS; do
+    [ -x "$VENV_DIR/bin/$command" ] \
+      || die "install finished but $VENV_DIR/bin/$command is missing"
+    link="$BIN_DIR/$command"
+    rm -f "$link"
+    ln -s "$VENV_DIR/bin/$command" "$link"
+    note "wired $link -> $VENV_DIR/bin/$command"
+  done
 
   link_skill
 
@@ -147,7 +161,7 @@ wire() {
   if [ -n "${SORTYOURPAPERYA_FROM_INSTALLER:-}" ]; then
     :
   elif on_path; then
-    note "run: sortyourpaperya --help"
+    note "run: sypy --help"
   else
     note ""
     note "$BIN_DIR is not on PATH. Add it:"
@@ -189,14 +203,28 @@ unwire() {
   # is not ours — and the skill should still come off when it is.
   unlink_skill
 
-  if [ ! -e "$LINK" ] && [ ! -L "$LINK" ]; then
-    note "nothing to remove at $LINK"
+  # Each name on its own: a `sypy` someone else wrote is theirs to keep, and
+  # refusing over it should not strand our own `sortyourpaperya` on PATH. The
+  # refusal is still an error, reported once every link that is ours is off.
+  local command link removed=0 refused=0
+  for command in $COMMANDS; do
+    link="$BIN_DIR/$command"
+    { [ -e "$link" ] || [ -L "$link" ]; } || continue
+    if ! links_into_venv "$link"; then
+      note "$link was not created by this script; leaving it alone"
+      refused=1
+      continue
+    fi
+    rm -f "$link"
+    note "unwired $link"
+    removed=1
+  done
+
+  [ "$refused" = 0 ] || exit 1
+  if [ "$removed" = 0 ]; then
+    note "nothing to remove in $BIN_DIR"
     return 0
   fi
-  links_into_venv || die "$LINK was not created by this script; leaving it alone"
-
-  rm -f "$LINK"
-  note "unwired $LINK"
   note "the virtualenv at $VENV_DIR is left in place; delete it to reclaim space"
 }
 
@@ -206,9 +234,10 @@ case "${1:-}" in
   relock) relock ;;
   *)
     printf 'usage: %s {wire|unwire|relock}\n' "$(basename "$0")" >&2
-    printf '\n  wire    install into %s, link it into %s,\n' "$VENV_DIR" "$BIN_DIR" >&2
+    printf '\n  wire    install into %s, link %s into %s,\n' \
+      "$VENV_DIR" "$COMMANDS" "$BIN_DIR" >&2
     printf '          and link the agent skill into %s\n' "$SKILLS_DIR" >&2
-    printf '  unwire  remove both links\n' >&2
+    printf '  unwire  remove the command and skill links\n' >&2
     printf '  relock  re-resolve dependencies and rewrite requirements.lock\n' >&2
     printf '\nOverride with SORTYOURPAPERYA_VENV_DIR / SORTYOURPAPERYA_BIN_DIR / SORTYOURPAPERYA_SKILLS_DIR.\n' >&2
     exit 2

@@ -456,8 +456,9 @@ without ingesting into it.
 
 It finds a Python 3.11 or newer — trying `python3.14` down to `python3`, since
 a distribution's `python3` is often older than the newest it also ships —
-builds a virtualenv inside the project, installs the pinned dependencies, and
-links `sortyourpaperya` into `~/.local/bin`, and links the agent skill into
+builds a virtualenv inside the project, links the command into `~/.local/bin`
+under both its names — `sortyourpaperya` and the short `sypy`, which run the
+same thing — and links the agent skill into
 `~/.claude/skills`. Nothing is written outside the project, those two
 directories, and (with `--service`) the supervisor's config — and the last two
 get a symlink each.
@@ -472,6 +473,10 @@ Override where things go with `SORTYOURPAPERYA_VENV_DIR`, `SORTYOURPAPERYA_BIN_D
 `SORTYOURPAPERYA_SKILLS_DIR`.
 
 ## Usage
+
+Every command below is spelled `sortyourpaperya` in full. `sypy` is the same
+command under a shorter name — both are installed, and the short one is what
+you will actually type.
 
 ```bash
 

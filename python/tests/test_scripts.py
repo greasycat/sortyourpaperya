@@ -376,6 +376,7 @@ def _wired(home: Path, tmp_path: Path, extra: dict | None = None) -> dict:
     venv_bin = tmp_path / "venv" / "bin"
     _stub(venv_bin, "python")  # answers the version check and every pip call
     _stub(venv_bin, "sortyourpaperya")
+    _stub(venv_bin, "sypy")
     env = {
         "HOME": str(home),
         "SORTYOURPAPERYA_PYTHON": str(_stub(tmp_path / "stubs", "python3")),
@@ -385,6 +386,49 @@ def _wired(home: Path, tmp_path: Path, extra: dict | None = None) -> dict:
     }
     env.update(extra or {})
     return env
+
+
+def test_both_command_names_land_on_path(home: Path, tmp_path: Path) -> None:
+    """`sypy` is the name anyone types; it has to be a real link, not an alias.
+
+    A shell alias would be invisible to the service, to a script, and to an
+    agent — none of which read your rc file.
+    """
+    result = _run(WIRE, "wire", env=_wired(home, tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    for name in ("sortyourpaperya", "sypy"):
+        link = home / "bin" / name
+        assert link.is_symlink(), f"{name} was not linked"
+        assert link.resolve() == tmp_path / "venv" / "bin" / name
+
+
+def test_unwiring_takes_both_names_back_off(home: Path, tmp_path: Path) -> None:
+    env = _wired(home, tmp_path)
+    _run(WIRE, "wire", env=env)
+
+    result = _run(WIRE, "unwire", env=env)
+
+    assert result.returncode == 0, result.stderr
+    for name in ("sortyourpaperya", "sypy"):
+        link = home / "bin" / name
+        assert not link.exists() and not link.is_symlink()
+
+
+def test_a_sypy_someone_else_wrote_does_not_strand_our_own_link(
+    home: Path, tmp_path: Path
+) -> None:
+    """Refusing over one name must still take the other off, and still fail."""
+    env = _wired(home, tmp_path)
+    _run(WIRE, "wire", env=env)
+    (home / "bin" / "sypy").unlink()
+    _stub(home / "bin", "sypy")  # a real file now, not our symlink
+
+    result = _run(WIRE, "unwire", env=env)
+
+    assert result.returncode != 0, "the foreign link should be reported"
+    assert not (home / "bin" / "sortyourpaperya").exists(), "ours still came off"
+    assert (home / "bin" / "sypy").is_file(), "theirs to keep"
 
 
 def test_wiring_links_the_skill_where_the_agent_looks(home: Path, tmp_path: Path) -> None:
