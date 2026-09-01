@@ -1178,12 +1178,58 @@ def remove(
         paper = _resolve(library, file_id)
         if not yes:
             typer.echo(f"{paper.store_name}\n  {_label(paper)}")
+            # What cites it, before it goes. The entry survives the document and
+            # keeps working — a citation is a claim about a paper, not about a
+            # file you hold — but it stops leading anywhere, and that is worth
+            # knowing while the choice is still open.
+            for citation in bibs.citations_of(library.root, paper.file_id):
+                typer.echo(f"  cited by {citation.bib_slug} as {citation.key}")
             # The stored file is the only copy when it arrived by move, so this
             # is not undoable.
             typer.confirm("permanently delete this document?", abort=True)
 
         library.remove(paper.file_id)
         typer.echo(f"removed {paper.file_id}")
+
+
+@app.command()
+def cited(
+    file_id: str = typer.Argument(..., help="Document id, or words from its title, authors, or keywords."),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print records instead of a table, for a program to read."
+    ),
+) -> None:
+    """Say which of the library's bibliographies cite a document, and as what.
+
+    The question `bib add` answers in one direction, asked in the other: not
+    "what does this manuscript cite" but "where have I already used this".
+
+    Nothing is stored to answer it. Each bibliography's record already names the
+    `file_id` it cites, so this reads them — which is why a `bib.toml` edited by
+    hand is answered correctly the moment it is saved, with nothing to rebuild.
+    """
+    settings = _settings(None, library_dir)
+    with Library(settings.output_dir) as library:
+        paper = _resolve(library, file_id)
+    found = bibs.citations_of(settings.output_dir, paper.file_id)
+
+    if as_json:
+        typer.echo(json.dumps(_cited_by(found), indent=2))
+        return
+    if not found:
+        typer.echo(f"no bibliography cites {paper.file_id}")
+        return
+    for citation in found:
+        typer.echo(f"{citation.bib_slug:<24}  {citation.key}")
+
+
+def _cited_by(found: Sequence["bibs.Citation"]) -> list[dict]:
+    """Citations as records. The slug names the bibliography a caller would use."""
+    return [
+        {"bib": citation.bib_slug, "bib_id": citation.bib_id, "key": citation.key}
+        for citation in found
+    ]
 
 
 @app.command()
@@ -1562,10 +1608,19 @@ def _report(library: Library, papers: Sequence[Paper], *, as_json: bool) -> None
         # --json` describes the entire library, and each record already costs
         # three queries to hydrate.
         held = library.db.attributes_for([paper.file_id for paper in papers])
+        # And one read of the bibliographies for the whole page, for the same
+        # reason: `list --json` describes the entire library, and re-reading
+        # every `bib.toml` per document would read each of them once per row.
+        citing = bibs.citations(library.root)
         typer.echo(
             json.dumps(
                 [
-                    _describe(library, paper, held.get(paper.file_id, {}))
+                    _describe(
+                        library,
+                        paper,
+                        held.get(paper.file_id, {}),
+                        citing.get(paper.file_id, []),
+                    )
                     for paper in papers
                 ],
                 indent=2,
@@ -1579,7 +1634,10 @@ def _report(library: Library, papers: Sequence[Paper], *, as_json: bool) -> None
 
 
 def _describe(
-    library: Library, paper: Paper, attributes: dict[str, str | None] | None = None
+    library: Library,
+    paper: Paper,
+    attributes: dict[str, str | None] | None = None,
+    citing: "Sequence[bibs.Citation] | None" = None,
 ) -> dict:
     """One document as a record, with the paths that lead to it.
 
@@ -1587,8 +1645,8 @@ def _describe(
     particular, and a record whose file cannot be opened from it is only half
     an answer.
 
-    `attributes` is passed in when the caller has already fetched them for a
-    whole page of results; left out, this fetches the one document's.
+    `attributes` and `citing` are passed in when the caller has already gathered
+    them for a whole page of results; left out, this gathers the one document's.
     """
     return {
         "id": paper.file_id,
@@ -1609,6 +1667,11 @@ def _describe(
         "pages_read": paper.pages_read,
         "attributes": (
             library.db.attributes(paper.file_id) if attributes is None else attributes
+        ),
+        "cited_by": _cited_by(
+            bibs.citations_of(library.root, paper.file_id)
+            if citing is None
+            else citing
         ),
     }
 

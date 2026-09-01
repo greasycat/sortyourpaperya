@@ -228,6 +228,12 @@ Citing the same document twice does nothing and says so; it does not duplicate
 the entry. `sortyourpaperya bib init "<name>"` starts a new bibliography, one
 per manuscript.
 
+To ask it the other way round — where have I already used this document —
+`sortyourpaperya cited <id>` names every bibliography citing it and the key each
+uses, and every `find --json` and `list --json` record carries the same under
+`cited_by`. Check it before suggesting a document be removed: the citation
+survives and keeps working, but stops leading anywhere.
+
 ## Re-file a document
 
 ```bash

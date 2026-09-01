@@ -540,6 +540,36 @@ The link points at the document's folder in the store, exactly as the tree's
 links do, so opening it lands on the book and on whatever is kept beside it.
 Only `@book` is shelved; `--type book` is how you say a document is one.
 
+### Which bibliographies cite a document
+
+```bash
+sortyourpaperya cited vaswani
+```
+
+```
+phd-thesis                vaswani2017attention
+review-2026               vaswani2017attention
+```
+
+The question `bib add` answers in one direction, asked in the other: not what
+this manuscript cites, but where you have already used this. Every `find --json`
+and `list --json` record carries the same thing as `cited_by`, and
+`sortyourpaperya remove` names it before asking to confirm — a citation survives
+the document being deleted and keeps working, since it is a claim about a paper
+and not about a file you hold, but it stops leading anywhere, and that is worth
+knowing while the choice is still open.
+
+**Nothing is stored to answer this.** Each bibliography's record already names
+the `file_id` it cites, so the answer is those records read backwards. A stored
+index would be a third thing to keep in step with the record and the `.bib`, and
+would be wrong for exactly as long as it took someone to notice; this cannot
+disagree with the record because it *is* the record, and a hand-edited
+`bib.toml` is answered correctly the moment it is saved, with nothing to
+rebuild. A page of records reads the bibliographies once, not once per row.
+
+A source with no `file_id` — a book cited by hand, something not in this library
+— cites no document here and appears nowhere in the answer.
+
 ### Notes on the manuscript, and on what it cites
 
 ```bash
@@ -737,6 +767,7 @@ sortyourpaperya bib note --lib thesis --cite <id> --path   # ...on one cited sou
 sortyourpaperya bib add                           # ...or be asked which, and which
 sortyourpaperya bib build --lib thesis            # re-generate the .bib from bib.toml
 sortyourpaperya bib list                          # every bibliography in the library
+sortyourpaperya cited <id>                        # which bibliographies cite a document
 sortyourpaperya remove <id>                       # delete link, folder, and record (asks first)
 sortyourpaperya scan                              # refresh hashes of files edited in place
 sortyourpaperya fsck [--adopt]                    # check the store and database agree

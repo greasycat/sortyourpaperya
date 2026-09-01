@@ -20,7 +20,9 @@ editing the TOML and running `sortyourpaperya bib build`, not by editing the
 `.bib` that the next write would throw away.
 
 A source names the document it came from by `file_id`, so a bibliography is a
-list of things in this library rather than a copy of them. Everything else in a
+list of things in this library rather than a copy of them — and so the library
+can be asked the question the other way round, which is what `citations` is
+for: not a second copy of what cites what, but the records read backwards. Everything else in a
 `[[source]]` table is a BibTeX field, carried through as written: the four keys
 this module reserves are `key`, `type`, `file_id`, and `added_at_ms`.
 
@@ -257,6 +259,50 @@ class Bibliography:
             self.bib_path.write_text(render(self), encoding="utf-8")
         except OSError as err:
             raise BibError(f"could not write {self.path}: {err}") from err
+
+
+@dataclass(frozen=True)
+class Citation:
+    """One bibliography citing one of the library's documents."""
+
+    bib_id: str
+    bib_slug: str
+    bib_name: str
+    key: str
+
+
+def citations(library_root: Path) -> dict[str, list[Citation]]:
+    """Which bibliographies cite which documents, keyed by `file_id`.
+
+    Read from the bibliographies' own records every time rather than kept as a
+    second copy of them. A stored index would be a third thing to keep in step
+    with the record and the `.bib`, and would be wrong for exactly as long as it
+    took someone to notice — where this cannot disagree with the record, because
+    it *is* the record, and a hand-edited `bib.toml` is answered correctly the
+    moment it is saved rather than after the next rebuild.
+
+    A source with no `file_id` — a book cited by hand, something not in this
+    library — cites no document here and so appears nowhere in the answer.
+    """
+    found: dict[str, list[Citation]] = {}
+    for bibliography in all_bibs(library_root):
+        for source in bibliography.sources:
+            if not source.file_id:
+                continue
+            found.setdefault(source.file_id, []).append(
+                Citation(
+                    bib_id=bibliography.id,
+                    bib_slug=bibliography.slug,
+                    bib_name=bibliography.name,
+                    key=source.key,
+                )
+            )
+    return found
+
+
+def citations_of(library_root: Path, file_id: str) -> list[Citation]:
+    """Every citation of one document. See `citations` for why nothing is stored."""
+    return citations(library_root).get(file_id, [])
 
 
 def link_into(bibliography: Bibliography, directory: Path) -> Path:

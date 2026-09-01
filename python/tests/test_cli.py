@@ -1375,3 +1375,90 @@ def test_a_pdf_and_a_folder_both_pass_the_check(tmp_path) -> None:
     _check_input(tmp_path)
     _check_input(write_pdf(tmp_path / "a.pdf", "attention"))
     _check_input(None)
+
+
+# ---- which bibliographies cite a document ------------------------------------
+
+
+def _twice_cited(library):
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "PhD Thesis")
+    _invoke(root, "bib", "init", "Review 2026")
+    for slug in ("phd-thesis", "review-2026"):
+        _invoke(root, "bib", "add", "--lib", slug, "--cite", paper.file_id)
+    return root, paper
+
+
+def test_cited_names_every_bibliography_and_the_key_it_uses(library) -> None:
+    root, paper = _twice_cited(library)
+
+    result = _invoke(root, "cited", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "phd-thesis" in result.stdout and "review-2026" in result.stdout
+    assert result.stdout.count("vaswani2017attention") == 2
+
+
+def test_cited_json_carries_what_a_caller_would_use(library) -> None:
+    import json
+
+    root, paper = _twice_cited(library)
+
+    result = _invoke(root, "cited", paper.file_id, "--json")
+
+    records = json.loads(result.stdout)
+    assert [r["bib"] for r in records] == ["phd-thesis", "review-2026"]
+    assert all(r["key"] == "vaswani2017attention" for r in records)
+
+
+def test_a_document_nothing_cites_says_so(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "cited", paper.file_id)
+
+    assert result.exit_code == 0
+    assert "no bibliography cites" in result.stdout
+
+
+def test_find_json_carries_what_cites_each_document(library) -> None:
+    import json
+
+    root, _ = _twice_cited(library)
+
+    result = _invoke(root, "find", "attention", "--json")
+
+    (record,) = json.loads(result.stdout)
+    assert [c["bib"] for c in record["cited_by"]] == ["phd-thesis", "review-2026"]
+
+
+def test_removing_a_cited_document_says_what_cites_it_first(library) -> None:
+    """The entry survives and keeps working, but stops leading anywhere."""
+    root, paper = _twice_cited(library)
+
+    result = _invoke(root, "remove", paper.file_id, input="n\n")
+
+    assert "cited by phd-thesis as vaswani2017attention" in result.stdout
+    assert "cited by review-2026 as vaswani2017attention" in result.stdout
+    assert result.exit_code == 1, "aborting is not a delete"
+    assert (root / "store" / paper.store_name).is_dir()
+
+
+def test_a_page_of_records_reads_the_bibliographies_once(library, monkeypatch) -> None:
+    """Not once per row: `list --json` describes the whole library."""
+    from sortyourpaperya import cli
+
+    root, _ = _twice_cited(library)
+    for number in range(3):
+        _invoke(root, "bib", "init", f"Other {number}")
+
+    reads = []
+    original = cli.bibs.citations
+    monkeypatch.setattr(
+        cli.bibs, "citations", lambda root: reads.append(root) or original(root)
+    )
+
+    result = _invoke(root, "list", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert len(reads) == 1

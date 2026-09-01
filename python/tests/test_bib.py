@@ -421,3 +421,61 @@ def test_a_bib_note_follows_the_same_rules_as_a_document_note(tmp_path: Path) ->
         made.note_path("outline.txt")
     with pytest.raises(bib.BibError, match="not a path"):
         made.note_path("../escape.md")
+
+
+# ---- the records, read backwards --------------------------------------------
+
+
+def test_citations_say_which_bibliographies_cite_which_documents(tmp_path: Path) -> None:
+    thesis = bib.create(tmp_path, "PhD Thesis")
+    review = bib.create(tmp_path, "Review 2026")
+    cited, uncited = make_paper(), make_paper()
+
+    for made in (thesis, review):
+        made.add(bib.source_from_paper(cited, {}))
+        made.save()
+
+    found = bib.citations(tmp_path)
+
+    assert sorted(c.bib_slug for c in found[cited.file_id]) == ["phd-thesis", "review-2026"]
+    assert all(c.key == "vaswani2017attention" for c in found[cited.file_id])
+    assert uncited.file_id not in found
+    assert bib.citations_of(tmp_path, uncited.file_id) == []
+
+
+def test_a_hand_edited_record_is_answered_with_nothing_to_rebuild(tmp_path: Path) -> None:
+    """Which is the whole reason nothing is stored: it cannot be stale."""
+    made = bib.create(tmp_path, "Thesis")
+    paper = make_paper()
+
+    made.record_path.write_text(
+        made.record_path.read_text()
+        + f'\n[[source]]\nkey = "byhand"\ntype = "misc"\n'
+        f'file_id = "{paper.file_id}"\ntitle = "Added By Hand"\n'
+    )
+
+    assert [c.key for c in bib.citations_of(tmp_path, paper.file_id)] == ["byhand"]
+
+
+def test_a_source_that_is_not_in_the_library_cites_nothing_in_it(tmp_path: Path) -> None:
+    """A book cited by hand has no file_id, so it names no document here."""
+    made = bib.create(tmp_path, "Thesis")
+    made.record_path.write_text(
+        made.record_path.read_text()
+        + '\n[[source]]\nkey = "knuth1984tex"\ntype = "book"\ntitle = "The TeXbook"\n'
+    )
+
+    assert bib.citations(tmp_path) == {}
+
+
+def test_a_citation_carries_what_a_caller_would_use_to_find_it(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "PhD Thesis")
+    paper = make_paper()
+    made.add(bib.source_from_paper(paper, {}))
+    made.save()
+
+    (citation,) = bib.citations_of(tmp_path, paper.file_id)
+
+    assert citation.bib_slug == "phd-thesis"
+    assert citation.bib_id == made.id
+    assert citation.bib_name == "PhD Thesis"
