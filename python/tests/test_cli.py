@@ -914,6 +914,9 @@ def _cited(library, **overrides):
     paper = Paper(**fields)
     library.db.upsert(paper)
     library.db.set_attribute(paper.file_id, "doi", "10.1000/xyz")
+    folder = library.document_dir(paper)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / paper.document_name).write_bytes(b"%PDF-1.4 not a real pdf")
     root = library.root
     library.close()
     return root, paper
@@ -1076,3 +1079,119 @@ def test_bib_add_asks_before_it_opens_the_database(library, monkeypatch) -> None
 
     assert result.exit_code == 0, result.output
     assert order == ["asked", "asked", "opened"]
+
+
+def test_bib_init_link_puts_the_folder_in_the_directory_it_was_run_from(
+    library, tmp_path, monkeypatch
+) -> None:
+    """`\\addbibresource{thesis/references.bib}` from the manuscript's own directory."""
+    root = library.root
+    library.close()
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+    monkeypatch.chdir(manuscript)
+
+    result = _invoke(root, "bib", "init", "Thesis", "--link")
+
+    assert result.exit_code == 0, result.output
+    link = manuscript / "thesis"
+    assert link.is_symlink()
+    assert (link / "references.bib").is_file()
+
+
+def test_bib_add_link_reaches_the_same_folder(library, tmp_path, monkeypatch) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+    monkeypatch.chdir(manuscript)
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id, "--link")
+
+    assert result.exit_code == 0, result.output
+    assert "@misc{vaswani2017attention," in (
+        manuscript / "thesis" / "references.bib"
+    ).read_text()
+
+
+def test_a_cited_book_is_shelved_inside_the_bibliography(library) -> None:
+    """So the one link into the manuscript carries the book with it."""
+    root, paper = _cited(library, file_id="dd44ee55ff66", title="The TeXbook",
+                         authors=["Donald Knuth"], year=1984,
+                         store_name="dd44ee55ff66__Books",
+                         document_name="knuth_1984_the-texbook.pdf")
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "attr", paper.file_id, "publisher", "Addison-Wesley")
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "@book{knuth1984texbook," in (
+        root / "bibs" / "thesis" / "references.bib"
+    ).read_text()
+    shelved = root / "bibs" / "thesis" / "knuth_1984" / "knuth_1984_the-texbook.pdf"
+    assert shelved.is_symlink()
+    assert "shelved knuth_1984/" in result.stdout
+
+
+def test_a_cited_paper_is_not_shelved(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    assert "shelved" not in result.stdout
+    assert sorted(p.name for p in (root / "bibs" / "thesis").iterdir()) == [
+        "bib.toml",
+        "references.bib",
+    ]
+
+
+def test_bib_note_opens_a_note_on_the_manuscript(library) -> None:
+    root = library.root
+    library.close()
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "note", "--lib", "thesis", "--path")
+
+    assert result.exit_code == 0, result.output
+    path = Path(result.stdout.strip())
+    assert path == root / "bibs" / "thesis" / "notes.md"
+    assert path.read_text() == "# Thesis\n\n"
+
+
+def test_bib_note_on_a_source_is_named_by_its_citation_key(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    result = _invoke(root, "bib", "note", "--lib", "thesis", "--cite", "vaswani", "--path")
+
+    assert result.exit_code == 0, result.output
+    assert Path(result.stdout.strip()) == (
+        root / "bibs" / "thesis" / "notes" / "vaswani2017attention.md"
+    )
+
+
+def test_a_source_note_is_not_the_documents_own_note(library) -> None:
+    """One describes the document; the other what it does for this manuscript."""
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    scoped = _invoke(root, "bib", "note", "--lib", "thesis", "--cite", "vaswani", "--path")
+    own = _invoke(root, "note", paper.file_id, "--path")
+
+    assert Path(scoped.stdout.strip()) != Path(own.stdout.strip())
+    assert "bibs" in str(Path(scoped.stdout.strip()))
+    assert "store" in str(Path(own.stdout.strip()))
+
+
+def test_a_note_on_something_the_bibliography_does_not_cite_says_so(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "note", "--lib", "thesis", "--cite", paper.file_id, "--path")
+
+    assert result.exit_code == 1
+    assert "does not cite" in result.stderr and "bib add" in result.stderr

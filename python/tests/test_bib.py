@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 
@@ -232,3 +233,191 @@ def test_a_citation_key_is_the_spelling_a_reference_manager_produces() -> None:
     assert cite_key(authors=["Ada Lovelace"], year=1843, title="On the Engine", fallback="x") == "lovelace1843engine"
     # A hyphenated surname is run together: a key is typed, not read.
     assert cite_key(authors=["Jean-Luc Picard"], year=1999, title="Warp", fallback="x") == "picard1999warp"
+
+
+# ---- linking the folder somewhere it is written against ---------------------
+
+
+def test_a_bibliography_is_linked_into_a_manuscript_directory(tmp_path: Path) -> None:
+    """One name reaching the record, the .bib, the notes, and the books."""
+    made = bib.create(tmp_path, "Thesis")
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+
+    link = bib.link_into(made, manuscript)
+
+    assert link == manuscript / "thesis"
+    assert link.is_symlink() and link.resolve() == made.path.resolve()
+    assert (link / "references.bib").is_file()
+
+
+def test_the_link_is_absolute_so_the_manuscript_can_move(tmp_path: Path) -> None:
+    """The two ends are independent trees and move for unrelated reasons."""
+    made = bib.create(tmp_path, "Thesis")
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+
+    link = bib.link_into(made, manuscript)
+
+    assert Path(os.readlink(link)).is_absolute()
+
+
+def test_linking_twice_is_the_wanted_state_not_an_error(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "Thesis")
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+
+    first = bib.link_into(made, manuscript)
+
+    assert bib.link_into(made, manuscript) == first
+
+
+def test_nothing_in_the_way_is_replaced(tmp_path: Path) -> None:
+    """Deciding someone else's file is stale is not this tool's call."""
+    made = bib.create(tmp_path, "Thesis")
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+    (manuscript / "thesis").write_text("mine", encoding="utf-8")
+
+    with pytest.raises(bib.BibError, match="already exists"):
+        bib.link_into(made, manuscript)
+    assert (manuscript / "thesis").read_text() == "mine"
+
+
+def test_a_link_pointing_elsewhere_is_refused(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "Thesis")
+    other = bib.create(tmp_path, "Paper")
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+    (manuscript / "thesis").symlink_to(other.path)
+
+    with pytest.raises(bib.BibError, match="link to something else"):
+        bib.link_into(made, manuscript)
+
+
+# ---- books, which you write alongside ---------------------------------------
+
+
+def book(**overrides) -> Paper:
+    fields = {"title": "The TeXbook", "authors": ["Donald Knuth"], "year": 1984}
+    fields.update(overrides)
+    return make_paper(**fields)
+
+
+def shelve(made, paper, store: Path):
+    """Cite `paper` as a book and shelve it, the way `bib add` does."""
+    source = made.add(
+        bib.source_from_paper(paper, {"publisher": "Addison-Wesley"})
+    )
+    folder = store / paper.store_name
+    folder.mkdir(parents=True, exist_ok=True)
+    return bib.shelve(made, source, folder, paper.document_name)
+
+
+def test_a_cited_book_is_linked_in_under_its_author_and_year(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "Thesis")
+    paper = book()
+
+    link = shelve(made, paper, tmp_path / "store")
+
+    assert link.parent.name == "knuth_1984"
+    assert link.name == paper.document_name
+    # At the document's folder, as the tree links: the book and what is beside it.
+    assert link.is_symlink() and link.resolve().is_dir()
+
+
+def test_only_a_book_is_shelved(tmp_path: Path) -> None:
+    """A paper is read once and cited; a book you go back to while writing."""
+    assert bib.source_from_paper(book(), {"publisher": "X"}).entry_type == bib.SHELVED_TYPE
+    assert bib.source_from_paper(make_paper(), {}).entry_type != bib.SHELVED_TYPE
+
+
+def test_a_second_book_by_one_author_in_one_year_adds_its_title(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "Thesis")
+    store = tmp_path / "store"
+
+    first = shelve(made, book(), store)
+    second = shelve(made, book(title="Concrete Mathematics"), store)
+
+    assert first.parent.name == "knuth_1984"
+    assert second.parent.name == "knuth_1984_concrete-mathematics"
+
+
+def test_a_book_nothing_tells_apart_is_refused(tmp_path: Path) -> None:
+    """One folder would quietly hold two different books."""
+    made = bib.create(tmp_path, "Thesis")
+    store = tmp_path / "store"
+    shelve(made, book(), store)
+    shelve(made, book(), store)
+
+    with pytest.raises(bib.BibError, match="nothing in the record tells them apart"):
+        shelve(made, book(), store)
+
+
+def test_a_book_with_no_author_is_shelved_under_its_citation_key(tmp_path: Path) -> None:
+    """A year alone names nothing, and a key is unique within a bibliography."""
+    made = bib.create(tmp_path, "Thesis")
+
+    link = shelve(made, book(authors=[], title="A Field Manual"), tmp_path / "store")
+
+    assert link.parent.name == "1984field"
+
+
+# ---- notes -------------------------------------------------------------------
+
+
+def test_a_bibliography_takes_notes_on_the_manuscript(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "Thesis")
+
+    assert made.note_path() == made.path / "notes.md"
+    assert made.note_path("outline") == made.path / "outline.md"
+    assert made.notes() == []
+
+    made.note_path().write_text("# Thesis\n", encoding="utf-8")
+    assert made.notes() == [made.path / "notes.md"]
+
+
+def test_the_record_and_the_bib_are_never_mistaken_for_notes(tmp_path: Path) -> None:
+    """Neither is a note format, so nothing has to be excluded by name."""
+    made = bib.create(tmp_path, "Thesis")
+
+    assert made.notes() == []
+
+
+def test_a_note_on_a_cited_source_is_named_by_its_key(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "Thesis")
+    source = made.add(bib.source_from_paper(make_paper(), {}))
+
+    assert made.source_note_path(source) == (
+        made.path / "notes" / "vaswani2017attention.md"
+    )
+    # A second one carries the key too: they share a folder, and `outline.md`
+    # in there would say nothing about whose outline it is.
+    assert made.source_note_path(source, "ch3").name == "vaswani2017attention-ch3.md"
+
+
+def test_a_source_sees_only_its_own_notes(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "Thesis")
+    one = made.add(bib.source_from_paper(make_paper(), {}))
+    two = made.add(bib.source_from_paper(book(), {}))
+
+    for path in (made.source_note_path(one), made.source_note_path(one, "ch3"),
+                 made.source_note_path(two)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+
+    assert [p.name for p in made.source_notes(one)] == [
+        "vaswani2017attention-ch3.md",
+        "vaswani2017attention.md",
+    ]
+    assert [p.name for p in made.source_notes(two)] == ["knuth1984texbook.md"]
+
+
+def test_a_bib_note_follows_the_same_rules_as_a_document_note(tmp_path: Path) -> None:
+    made = bib.create(tmp_path, "Thesis")
+
+    assert made.note_path("extracted.json").name == "extracted.json"
+    with pytest.raises(bib.BibError, match="a note is"):
+        made.note_path("outline.txt")
+    with pytest.raises(bib.BibError, match="not a path"):
+        made.note_path("../escape.md")

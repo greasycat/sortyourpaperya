@@ -934,6 +934,25 @@ def test_bibliographies_are_backed_up(library: Library, tmp_path: Path) -> None:
     assert report.bibliographies == 1
 
 
+def test_a_shelved_book_is_backed_up_as_a_link_not_a_second_copy(
+    library: Library, tmp_path: Path
+) -> None:
+    """Following it would copy every book again and restore links as files."""
+    from sortyourpaperya import bib
+
+    paper = _paper(["Books"])
+    library.file_paper(paper, write_pdf(tmp_path / "raw" / "book.pdf", "texbook"))
+    made = bib.create(library.root, "Thesis")
+    source = made.add(bib.source_from_paper(paper, {"publisher": "Addison-Wesley"}))
+    bib.shelve(made, source, library.document_dir(paper), paper.document_name)
+
+    report = library.backup(tmp_path / "backup")
+
+    copied = report.destination / "bibs" / "thesis" / "vaswani_2017"
+    assert copied.is_dir()
+    assert all(entry.is_symlink() for entry in copied.iterdir())
+
+
 def test_notes_kept_beside_a_document_are_backed_up(
     library: Library, tmp_path: Path
 ) -> None:

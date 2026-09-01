@@ -1,9 +1,16 @@
 """Bibliographies kept beside the library: what you cite, and the file LaTeX reads.
 
-A bibliography is a folder under `<library>/bibs/<slug>/` holding two files:
+A bibliography is a folder under `<library>/bibs/<slug>/`:
 
     bib.toml          the record, and the one you edit
     references.bib    generated from it, and the one LaTeX reads
+    notes.md          about the manuscript; any markdown or JSON file is one
+    notes/<key>.md    about one thing it cites, in this manuscript
+    knuth_1984/       a cited book, linked in so it is at hand while writing
+
+`sortyourpaperya bib add --link` puts a link to the whole folder in the
+directory it was run from, so a manuscript reaches all of it through one name:
+`\\addbibresource{thesis/references.bib}` beside the notes and the books.
 
 **The TOML is the source of truth and the `.bib` is a projection of it**, the
 same way the database is the truth behind the store's filenames. That is what
@@ -32,11 +39,22 @@ from string import ascii_lowercase
 import tomli_w
 
 from .db import Paper, now_ms
-from .naming import cite_key, new_id, slugify
+from .naming import author_year, cite_key, new_id, slugify, title_slug
+from .notes import DEFAULT_NOTE, NoteError, note_name, notes_in
 
 BIBS_DIR = "bibs"
 RECORD_FILE = "bib.toml"
 BIB_FILE = "references.bib"
+
+# Notes about one cited source, keyed by its citation key. Notes about the
+# manuscript itself sit beside the record, the way a document's notes sit
+# beside the document.
+NOTES_DIR = "notes"
+
+# The entry type whose document is linked into the bibliography when it is
+# cited. A book is what you read alongside writing — you go back to it, and to
+# a chapter at a time — where a paper is read once and cited.
+SHELVED_TYPE = "book"
 
 # What a `[[source]]` table uses for its own bookkeeping. Every other key in it
 # is a BibTeX field and is written out as one, so a bibliography can carry a
@@ -155,6 +173,77 @@ class Bibliography:
         self.sources.append(source)
         return source
 
+    def note_path(self, name: str = "") -> Path:
+        """Where a note about the manuscript belongs, whether or not it exists.
+
+        Beside the record, the way a document's notes sit beside the document.
+        Nothing here needs protecting from being called a note: the record is
+        TOML and the bibliography is `.bib`, and neither is a note format.
+        """
+        try:
+            return self.path / note_name(name or DEFAULT_NOTE)
+        except NoteError as err:
+            raise BibError(str(err)) from err
+
+    def notes(self) -> list[Path]:
+        """Every note about the manuscript, in the order they read."""
+        return notes_in(self.path)
+
+    def source_note_path(self, source: Source, name: str = "") -> Path:
+        """Where a note about one cited source belongs.
+
+        `notes/<key>.md`, named by the citation key: the one name the source is
+        sure to have, and the one already typed to cite it. A second note about
+        the same source is `notes/<key>-<name>.md` — every source's notes carry
+        its key, because they share one folder and a note called `outline.md`
+        in there would say nothing about whose outline it is.
+
+        This is not the document's own notes. Those describe the document and
+        are shared by every bibliography citing it; this is what the document
+        does for *this* manuscript, and the two do not belong in one file.
+        """
+        try:
+            wanted = f"{source.key}-{name}" if name else f"{source.key}.md"
+            return self.path / NOTES_DIR / note_name(wanted)
+        except NoteError as err:
+            raise BibError(str(err)) from err
+
+    def source_notes(self, source: Source) -> list[Path]:
+        """Every note this bibliography keeps about one cited source."""
+        return [
+            path
+            for path in notes_in(self.path / NOTES_DIR)
+            if path.stem == source.key or path.stem.startswith(f"{source.key}-")
+        ]
+
+    def shelf(self, source: Source) -> Path:
+        """The folder a cited book is linked into, inside the bibliography.
+
+        Named for its author and year — `knuth_1984` — which is how a shelf is
+        arranged and how the book is cited. A second book by the same author in
+        the same year adds its title; a third that matches on that too is
+        refused, because at that point nothing in the record tells them apart
+        and one folder would quietly hold both.
+
+        A book with no author is filed under its citation key, which is unique
+        within a bibliography and so cannot collide at all.
+        """
+        base = author_year(
+            [str(name) for name in source.fields.get("author") or []],
+            source.fields.get("year") if isinstance(source.fields.get("year"), int) else None,
+        )
+        if not base:
+            return self.path / source.key
+
+        titled = title_slug(str(source.fields.get("title") or ""))
+        for candidate in (base, f"{base}_{titled}" if titled else ""):
+            if candidate and not (self.path / candidate).exists():
+                return self.path / candidate
+        raise BibError(
+            f"{self.path / base}_{titled} already holds a book by the same "
+            "author, year, and title; nothing in the record tells them apart"
+        )
+
     def save(self) -> None:
         """Write the record, then regenerate the `.bib` from it.
 
@@ -168,6 +257,69 @@ class Bibliography:
             self.bib_path.write_text(render(self), encoding="utf-8")
         except OSError as err:
             raise BibError(f"could not write {self.path}: {err}") from err
+
+
+def link_into(bibliography: Bibliography, directory: Path) -> Path:
+    """Link the bibliography's folder into `directory`, under its slug.
+
+    One name in the manuscript's own directory reaching the record, the
+    generated `.bib`, the notes, and any books cited — so a paper is written
+    against `thesis/references.bib` without knowing where the library lives.
+
+    The link is absolute, unlike the tree's, which are relative so the library
+    can be moved as a whole. Here the two ends are independent: a manuscript
+    directory and a library move for unrelated reasons, and a relative link
+    would be the one that breaks when either does.
+
+    Nothing already in the way is replaced. A link that already points here is
+    the wanted state and is returned; anything else is the caller's, and
+    deciding it was stale is not this tool's call.
+
+    Raises:
+        BibError: if the name is taken by anything else.
+    """
+    link = directory / bibliography.slug
+    target = bibliography.path.resolve()
+    if link.is_symlink():
+        if link.resolve() == target:
+            return link
+        raise BibError(f"{link} is already a link to something else")
+    if link.exists():
+        raise BibError(f"{link} already exists")
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as err:
+        raise BibError(f"could not link {link}: {err}") from err
+    return link
+
+
+def shelve(
+    bibliography: Bibliography, source: Source, document_dir: Path, name: str
+) -> Path:
+    """Link a cited book's folder into the bibliography, and say where.
+
+    The link points at the document's folder in the store and is named the way
+    the tree names its links, so a book reached this way looks and opens like a
+    book reached through a category: on the document, and on whatever its owner
+    keeps beside it.
+
+    Absolute, for the same reason `link_into` is — the bibliography may itself
+    be reached through a link from a manuscript directory somewhere else, and a
+    relative link would be resolved from wherever that lands.
+
+    Raises:
+        BibError: if the folder cannot be made, or the book cannot be told
+            apart from one already shelved.
+    """
+    shelf = bibliography.shelf(source)
+    link = shelf / name
+    try:
+        shelf.mkdir(parents=True, exist_ok=True)
+        if not link.is_symlink():
+            link.symlink_to(document_dir.resolve(), target_is_directory=True)
+    except OSError as err:
+        raise BibError(f"could not shelve {source.key}: {err}") from err
+    return link
 
 
 def bibs_dir(library_root: Path) -> Path:

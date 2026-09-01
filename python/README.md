@@ -176,6 +176,11 @@ library/
     phd-thesis/
       bib.toml              <- what you cite, and the file you edit
       references.bib        <- generated from it, and the file LaTeX reads
+      notes.md              <- about the manuscript
+      notes/
+        knuth1984texbook.md <- about one thing it cites, in this manuscript
+      knuth_1984/
+        knuth_1984_the-texbook.pdf -> ../../../store/aa11bb22cc33__...
 ```
 
 Every document has one home: a folder in the store holding the document and
@@ -376,6 +381,25 @@ sortyourpaperya bib init "PhD Thesis"                       # bibs/phd-thesis/
 sortyourpaperya bib add --lib phd-thesis --cite 5112ee75ddcf
 ```
 
+`--link` puts a link to the whole bibliography folder in the directory you ran
+the command from, which is how a manuscript reaches all of it through one name:
+
+```bash
+cd ~/papers/thesis
+sortyourpaperya bib init "PhD Thesis" --link      # ./thesis -> <library>/bibs/phd-thesis
+```
+
+```latex
+\addbibresource{thesis/references.bib}
+```
+
+It works on `bib add` too, so a bibliography started elsewhere is reached from
+here without going and finding it. The link is absolute, unlike the tree's,
+which are relative so the library can be moved as a whole: here the two ends
+are independent trees that move for unrelated reasons, and a relative link is
+the one that breaks when either does. Nothing already in the way is replaced —
+deciding a file someone else put there is stale is not this tool's call.
+
 Leave off `--lib`, `--cite`, or both and you are asked, with the bibliographies
 listed and the first offered as the default — so a library with one takes a
 keystroke, and a library with several cannot have the wrong one picked for it.
@@ -460,6 +484,59 @@ A document with no author — a bill, a manual — draws
 sorts by author, and is sorted first. The entry is written and the run
 succeeds; it is what citing an authorless document costs, and `biblatex` does
 not mind at all.
+
+### Books, which you write alongside
+
+A cited **book** is linked into the bibliography as well as written into it:
+
+```
+bibs/phd-thesis/
+  knuth_1984/
+    knuth_1984_the-texbook.pdf -> ../../../store/aa11bb22cc33__Reference/
+```
+
+A paper is read once and cited; a book you go back to, and to a chapter at a
+time, so it is the one worth having at hand — and because it lives inside the
+bibliography, the one `--link` carries it along to the manuscript.
+
+The folder is named for the author and year, the way a shelf is arranged. A
+second book by the same author in the same year adds its title —
+`knuth_1984_concrete-mathematics` — and a third that matches on that too is
+refused, because at that point nothing in the record tells them apart and one
+folder would quietly hold both. A book with no author is filed under its
+citation key, which is unique within a bibliography and so cannot collide.
+
+The link points at the document's folder in the store, exactly as the tree's
+links do, so opening it lands on the book and on whatever is kept beside it.
+Only `@book` is shelved; `--type book` is how you say a document is one.
+
+### Notes on the manuscript, and on what it cites
+
+```bash
+sortyourpaperya bib note --lib thesis --path                    # about the manuscript
+sortyourpaperya bib note outline --lib thesis --path            # ...a note by name
+sortyourpaperya bib note --lib thesis --cite vaswani --path     # about one cited source
+sortyourpaperya bib note ch3 --lib thesis --cite vaswani --path # ...a second one
+```
+
+Same rules as a document's notes: any markdown or JSON file is one, a bare word
+means markdown, and a bibliography with several notes lists them rather than
+guessing which you meant.
+
+A note on a cited source is `notes/<key>.md`, named by the citation key, and a
+second is `notes/<key>-<name>.md`. Every one carries the key because they share
+a folder — an `outline.md` in there would say nothing about whose outline it is.
+
+**This is deliberately not `sortyourpaperya note <id>`.** That note describes
+the document and is shared by every bibliography citing it; this one is what
+the document does for *this* manuscript — why it is in chapter 3, which claim
+it supports, what you disagree with. The two do not belong in one file, and a
+document dropped from one manuscript should not take the other's notes with it.
+
+`--cite` takes a citation key as well as a document. The key is tried first and
+exactly, so notes can still be opened on a source whose document has since left
+the library: the bibliography still cites it, and what you wrote is still worth
+reading.
 
 ## Reading the library from a program
 
@@ -620,8 +697,10 @@ sortyourpaperya note kahn                         # id or words: any command tak
 sortyourpaperya note <id>                         # open this document's notes ($EDITOR)
 sortyourpaperya note <id> reading-log             # ...a note by name; .md unless you say .json
 sortyourpaperya note <id> --path                  # ...or just say where they are
-sortyourpaperya bib init "PhD Thesis"             # start a bibliography under bibs/
+sortyourpaperya bib init "PhD Thesis" --link      # start one, and link it into ./
 sortyourpaperya bib add --lib thesis --cite <id>  # cite a document in it
+sortyourpaperya bib note --lib thesis --path      # notes on the manuscript
+sortyourpaperya bib note --lib thesis --cite <id> --path   # ...on one cited source
 sortyourpaperya bib add                           # ...or be asked which, and which
 sortyourpaperya bib build --lib thesis            # re-generate the .bib from bib.toml
 sortyourpaperya bib list                          # every bibliography in the library

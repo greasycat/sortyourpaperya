@@ -13,6 +13,7 @@ from typing import Sequence
 import typer
 
 from . import bib as bibs
+from . import notes
 from .bib import BibError, Bibliography
 from .budget import Budget
 from .config import (
@@ -548,22 +549,9 @@ def note(
                 raise typer.Exit(code=1)
             path = existing[0] if existing else library.note_path(paper)
 
-        if not path.exists():
-            # An empty JSON note has to parse, or it is broken for the only
-            # thing JSON is kept for.
-            if path.suffix.lower() == ".json":
-                path.write_text("{}\n", encoding="utf-8")
-            else:
-                title = paper.title or paper.original_name or paper.store_name
-                path.write_text(f"# {title}\n\n", encoding="utf-8")
+        notes.create(path, _label(paper))
 
-    editor = None if path_only else (os.environ.get("VISUAL") or os.environ.get("EDITOR"))
-    if editor:
-        # Split so EDITOR="code -w" works, and let the editor own the terminal.
-        subprocess.call([*editor.split(), str(path)])
-    else:
-        # No editor configured, so print the path for the caller to use.
-        typer.echo(path)
+    _open_or_print(path, path_only)
 
 
 bib_app = typer.Typer(
@@ -577,6 +565,9 @@ app.add_typer(bib_app, name="bib")
 def bib_init(
     name: str = typer.Argument(..., help="What the bibliography is called, e.g. 'PhD Thesis'."),
     library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    link: bool = typer.Option(
+        False, "--link", help="Also link the bibliography's folder into this directory."
+    ),
 ) -> None:
     """Start a new bibliography under the library's `bibs/` folder.
 
@@ -595,6 +586,8 @@ def bib_init(
     typer.echo(f"{bibliography.slug}  {bibliography.id}  {bibliography.name}")
     typer.echo(f"  record  {bibliography.record_path}")
     typer.echo(f"  bib     {bibliography.bib_path}")
+    if link:
+        _link_here(bibliography)
 
 
 @bib_app.command("list")
@@ -652,6 +645,9 @@ def bib_add(
         None, "--key", help="Citation key. Built from author, year, and title if left out."
     ),
     library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    link: bool = typer.Option(
+        False, "--link", help="Also link the bibliography's folder into this directory."
+    ),
 ) -> None:
     """Cite one of the library's documents in one of its bibliographies.
 
@@ -664,6 +660,15 @@ def bib_add(
     `sortyourpaperya attr` puts what the model was never asked for. What the
     library does not know is added by editing `bib.toml` and running
     `sortyourpaperya bib build`.
+
+    A cited book is also linked into the bibliography, under a folder named for
+    its author and year. A book is what you write alongside — you go back to
+    it, and to a chapter at a time — where a paper is read once and cited, so
+    it is the one worth having at hand rather than in the store.
+
+    `--link` puts a link to the whole bibliography folder in the directory this
+    was run from, which is how a manuscript reaches the `.bib`, the notes, and
+    those books through one name.
     """
     settings = _settings(None, library_dir)
 
@@ -690,9 +695,15 @@ def bib_add(
             entry_type=entry_type,
             key=key,
         )
+        document_dir = library.document_dir(paper)
 
     written = bibliography.add(source)
     try:
+        shelved = (
+            bibs.shelve(bibliography, written, document_dir, paper.document_name)
+            if written.entry_type == bibs.SHELVED_TYPE
+            else None
+        )
         bibliography.save()
     except BibError as err:
         typer.echo(f"error: {err}", err=True)
@@ -702,6 +713,10 @@ def bib_add(
     if key and written.key != key:
         typer.echo(f"  {key!r} was taken; cited as {written.key}", err=True)
     typer.echo(f"  {bibliography.bib_path}")
+    if shelved is not None:
+        typer.echo(f"  shelved {shelved.parent.name}/{shelved.name}")
+    if link:
+        _link_here(bibliography)
 
 
 @bib_app.command("build")
@@ -728,6 +743,128 @@ def bib_build(
         f"wrote {len(bibliography.sources)} entr"
         f"{'y' if len(bibliography.sources) == 1 else 'ies'} to {bibliography.bib_path}"
     )
+
+
+@bib_app.command("note")
+def bib_note(
+    name: str = typer.Argument(
+        None,
+        help="Which note. A bare word is markdown, so `outline` means `outline.md`.",
+    ),
+    lib: str = typer.Option(
+        None, "--lib", help="Which bibliography, by slug or id. Asked for if left out."
+    ),
+    cite: str = typer.Option(
+        None,
+        "--cite",
+        help="Take notes on one cited source instead of on the manuscript.",
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    path_only: bool = typer.Option(
+        False, "--path", help="Print where the note is instead of opening it."
+    ),
+) -> None:
+    """Open a bibliography's notes, creating them if they do not exist yet.
+
+    Without `--cite`, a note about the manuscript: an outline, an argument, a
+    list of what still has to be cited. It sits beside the record, so it is
+    reached through the same `--link` and copied by the same backup.
+
+    With `--cite`, a note about one thing the manuscript cites —
+    `notes/<key>.md`, named by the citation key. That is deliberately not the
+    document's own notes, which describe the document and are shared by every
+    bibliography citing it: this is what the document does for *this*
+    manuscript, and the two do not belong in one file.
+
+    `--path` prints the file and stops, the way `sortyourpaperya note` does.
+    """
+    settings = _settings(None, library_dir)
+    bibliography = _pick_bib(settings.output_dir, lib)
+
+    try:
+        if cite is None:
+            path = _one_note(
+                bibliography.notes(), name, bibliography.note_path, "the manuscript"
+            )
+            heading = bibliography.name
+        else:
+            source = _cited_source(bibliography, settings.output_dir, cite)
+            path = _one_note(
+                bibliography.source_notes(source),
+                name,
+                lambda given: bibliography.source_note_path(source, given),
+                source.key,
+            )
+            heading = f"{source.key} in {bibliography.name}"
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    notes.create(path, heading)
+    _open_or_print(path, path_only)
+
+
+def _one_note(existing: list[Path], name: str | None, at, subject: str) -> Path:
+    """The note a command should open: the named one, or the only one there is.
+
+    Picking one of several would be a guess, and the wrong guess is written
+    into by a caller that asked for "the" notes and got another — so several
+    are listed and none is chosen, exactly as `sortyourpaperya note` does.
+    """
+    if name:
+        return at(name)
+    if len(existing) > 1:
+        listed = "\n".join(f"  {path.name}" for path in existing)
+        raise BibError(f"{subject} has several notes. Name one:\n{listed}")
+    return existing[0] if existing else at("")
+
+
+def _cited_source(bibliography: Bibliography, library_root: Path, needle: str):
+    """The source a `--cite` names: its citation key, or the document it cites.
+
+    The key is tried first and exactly, so a note can always be opened on a
+    source whose document has since left the library — the bibliography still
+    cites it, and what was written about it is still worth reading.
+    """
+    exact = next((s for s in bibliography.sources if s.key == needle), None)
+    if exact is not None:
+        return exact
+
+    with Library(library_root) as library:
+        paper = _resolve(library, needle)
+    source = bibliography.source_for(paper.file_id)
+    if source is None:
+        raise BibError(
+            f"{bibliography.slug} does not cite {paper.file_id}; "
+            f"`sortyourpaperya bib add --lib {bibliography.slug} "
+            f"--cite {paper.file_id}` does"
+        )
+    return source
+
+
+def _open_or_print(path: Path, path_only: bool) -> None:
+    """Hand the note to $EDITOR, or print where it is.
+
+    A caller that means to write the note itself has no use for an editor, and
+    one inheriting an `$EDITOR` it cannot drive would be left holding a
+    terminal open forever.
+    """
+    editor = None if path_only else (os.environ.get("VISUAL") or os.environ.get("EDITOR"))
+    if editor:
+        # Split so EDITOR="code -w" works, and let the editor own the terminal.
+        subprocess.call([*editor.split(), str(path)])
+    else:
+        typer.echo(path)
+
+
+def _link_here(bibliography: Bibliography) -> None:
+    """Link the bibliography's folder into the directory the command was run in."""
+    try:
+        link = bibs.link_into(bibliography, Path.cwd())
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+    typer.echo(f"  linked  {link} -> {bibliography.path}")
 
 
 def _pick_bib(library_root: Path, needle: str | None) -> Bibliography:

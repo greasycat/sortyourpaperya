@@ -126,7 +126,7 @@ def link_name(
     rather than being called `2017.pdf`.
     """
     author = _first_author_surname(authors or [])
-    slug = _truncate_words(slugify(title or ""), MAX_TITLE_SLUG_CHARS)
+    slug = title_slug(title)
     if not (author or slug):
         return fallback
 
@@ -143,6 +143,24 @@ def disambiguate(name: str, paper_id: str) -> str:
     if not dot:
         return f"{name}_{paper_id}"
     return f"{stem}_{paper_id}.{suffix}"
+
+
+def title_slug(title: str | None) -> str:
+    """A title as a slug, cut between words rather than inside one."""
+    return _truncate_words(slugify(title or ""), MAX_TITLE_SLUG_CHARS)
+
+
+def author_year(authors: list[str] | None = None, year: int | None = None) -> str:
+    """`knuth_1984` — who and when, which is how a shelf is arranged.
+
+    Empty when there is no author to arrange by: a year on its own names
+    nothing, here as much as in `link_name`, and the caller has to fall back
+    to something that does.
+    """
+    surname = _first_author_surname(authors or [])
+    if not surname:
+        return ""
+    return f"{surname}_{year}" if year else surname
 
 
 def cite_key(

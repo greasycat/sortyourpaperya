@@ -143,12 +143,22 @@ not backed up.
 ```bash
 sortyourpaperya bib list --json                                  # which bibliographies exist
 sortyourpaperya bib add --lib thesis --cite 5112ee75ddcf         # cite one document in one
+sortyourpaperya bib add --lib thesis --cite 5112ee75ddcf --link  # ...and link the folder into ./
 ```
 
-A bibliography lives at `bibs/<slug>/` inside the library and holds two files:
-`bib.toml`, the record, and `references.bib`, generated from it — the one to
-point LaTeX at. `bib add` writes both. It reports the citation key it used,
-which is what goes inside `\cite{}`.
+A bibliography lives at `bibs/<slug>/` inside the library. It holds `bib.toml`,
+the record, and `references.bib`, generated from it — the one to point LaTeX at
+— plus its notes and any books it cites. `bib add` writes both files. It reports
+the citation key it used, which is what goes inside `\cite{}`.
+
+`--link` puts a link to the whole folder in the directory the command ran in, so
+a manuscript reaches all of it as `thesis/references.bib`. Use it when the user
+is working in a paper directory and wants the bibliography reachable from there;
+it is safe to pass twice, and it never replaces anything already in the way.
+
+A cited **book** is also linked into the bibliography, under a folder named for
+its author and year (`bibs/thesis/knuth_1984/`). Only `@book` is; pass
+`--type book` when a document is one and the library has no `publisher` on it.
 
 **Always pass both `--lib` and `--cite`.** Either one left out is asked for at
 a prompt you cannot answer.
@@ -164,6 +174,27 @@ bibliography, so a verdict or a reading date is safe to keep on a document.
 To correct or add anything afterwards, edit `bib.toml` and run
 `sortyourpaperya bib build --lib <slug>`. **Never edit `references.bib`** — it
 is regenerated from the TOML and the next `bib add` overwrites it.
+
+### Notes scoped to a manuscript
+
+```bash
+sortyourpaperya bib note --lib thesis --path                 # about the manuscript
+sortyourpaperya bib note --lib thesis --cite vaswani2017attention --path   # about one source
+```
+
+Prints the path, creating the note if it does not exist. **Always pass `--lib`,
+and always pass `--path`** — without `--lib` you are asked at a prompt you
+cannot answer, and without `--path` the command opens `$EDITOR` and hangs.
+
+A source note is `notes/<key>.md`. `--cite` takes the citation key or the
+document; prefer the key, which you already have from `bib add` or `bib list`.
+
+**Choose the right note.** `sortyourpaperya note <id>` describes the *document*
+and is shared by every bibliography citing it — a summary, what it measured,
+where its data is. `bib note --cite` is what that document does for *this*
+manuscript — why it is in chapter 3, which claim it supports, what to push back
+on. Writing the second kind into the first leaks one paper's argument into
+every other paper that cites the same document.
 
 Citing the same document twice does nothing and says so; it does not duplicate
 the entry. `sortyourpaperya bib init "<name>"` starts a new bibliography, one
@@ -225,9 +256,9 @@ fails intermittently and for a reason that has nothing to do with the question.
   `--yes` only after the user has said yes to that document, and only with an
   exact id — `--yes` refuses words, because what a word matches changes as the
   library grows.
-- `sortyourpaperya bib init` starts a bibliography and `bib add` edits one. Both
-  only write inside `bibs/`, but a bibliography is the user's manuscript:
-  run them when asked, not to tidy up.
+- `sortyourpaperya bib init`, `bib add`, and `bib note` write inside `bibs/`,
+  and `--link` writes one symlink into the current directory. A bibliography is
+  the user's manuscript: run them when asked, not to tidy up.
 - `sortyourpaperya fsck`, `scan`, `tree`, `migrate-store`, and `backup` are maintenance.
   They are safe, but run them when asked, not speculatively.
 
