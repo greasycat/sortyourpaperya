@@ -732,3 +732,22 @@ async def test_an_unreadable_banked_answer_is_only_a_miss(
 
     assert len(client.batches) == 2
     assert report.processed == 1
+
+
+async def test_naming_one_pdf_files_that_one_and_leaves_the_rest(
+    settings: Settings, library: Library
+) -> None:
+    """One document filed without first putting it in a folder of its own."""
+    from dataclasses import replace
+
+    wanted = write_pdf(settings.input_dir / "wanted.pdf", "attention")
+    write_pdf(settings.input_dir / "other.pdf", "something else entirely")
+
+    report = await ingest_folder(
+        replace(settings, input_dir=wanted), FakeLlmClient(), library, mode=FilingMode.COPY
+    )
+
+    assert report.processed == 1
+    assert [paper.original_name for paper in library.db.all_papers()] == ["wanted.pdf"]
+    # And the one not named is left exactly as it was.
+    assert (settings.input_dir / "other.pdf").is_file()

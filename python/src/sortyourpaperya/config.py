@@ -99,8 +99,12 @@ def resolve_settings(
     load_dotenv(_repo_dotenv(), override=False)
 
     resolved_input = _first_path(input_dir, os.getenv("SYP_INPUT"), Path.cwd())
+    # `sorted` goes beside a single PDF rather than inside it: an input naming
+    # one document still has a folder it lives in, and that folder is where a
+    # library would have gone had the whole of it been named.
+    beside = resolved_input.parent if resolved_input.is_file() else resolved_input
     resolved_output = _first_path(
-        output_dir, os.getenv("SYP_OUTPUT"), resolved_input / DEFAULT_OUTPUT_DIR
+        output_dir, os.getenv("SYP_OUTPUT"), beside / DEFAULT_OUTPUT_DIR
     )
     return Settings(
         input_dir=resolved_input,

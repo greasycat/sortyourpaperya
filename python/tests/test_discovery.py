@@ -78,3 +78,38 @@ def test_a_file_vanishing_mid_scan_does_not_raise(tmp_path: Path) -> None:
         found = discover_pdfs(tmp_path)
 
     assert [p.path.name for p in found] == ["b.pdf"], "the survivor is still listed"
+
+
+def test_a_single_pdf_is_the_list_of_one_it_is(tmp_path: Path) -> None:
+    """Filing one document and filing its folder are the same request."""
+    write_pdf(tmp_path / "wanted.pdf", "attention")
+    write_pdf(tmp_path / "other.pdf", "something else")
+
+    found = discover_pdfs(tmp_path / "wanted.pdf")
+
+    assert [candidate.path.name for candidate in found] == ["wanted.pdf"]
+
+
+def test_a_file_that_is_not_a_pdf_offers_nothing(tmp_path: Path) -> None:
+    (tmp_path / "notes.txt").write_text("not a pdf", encoding="utf-8")
+
+    assert discover_pdfs(tmp_path / "notes.txt") == []
+
+
+def test_a_path_that_is_not_there_is_empty_rather_than_an_error(tmp_path: Path) -> None:
+    """A folder deleted under a running watcher must not take the service down.
+
+    Which is why a typo is caught in `cli`, where it was typed, instead.
+    """
+    assert discover_pdfs(tmp_path / "gone") == []
+
+
+def test_a_single_pdf_files_its_library_beside_it_not_inside_it(tmp_path: Path) -> None:
+    """`<file>.pdf/sorted` is not a folder anything could be written to."""
+    from sortyourpaperya.config import resolve_settings
+
+    path = write_pdf(tmp_path / "inbox" / "wanted.pdf", "attention")
+
+    settings = resolve_settings(path)
+
+    assert settings.output_dir == (tmp_path / "inbox" / "sorted").resolve()

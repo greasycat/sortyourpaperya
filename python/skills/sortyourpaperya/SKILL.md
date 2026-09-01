@@ -279,6 +279,10 @@ fails intermittently and for a reason that has nothing to do with the question.
   document's text to OpenAI and cost money.** Never run either to answer a
   question. Run them only when the user asks for documents to be filed, and use
   `--mode copy` unless they ask for `move`, which drains the source folder.
+  `--input` takes a single PDF as well as a folder, so filing one document the
+  user names is `sortyourpaperya ingest --input <file>.pdf --mode copy` — that
+  is one request paid for, where naming its folder would file everything else
+  sitting in it too.
 - **`sortyourpaperya remove` deletes the document, its notes, and its record.** When the
   document arrived by move, that is the only copy. Ask first, every time; pass
   `--yes` only after the user has said yes to that document, and only with an

@@ -113,7 +113,9 @@ def _configure(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
 
 @app.command()
 def ingest(
-    input_dir: Path = typer.Option(None, "--input", "-i", help="Folder of PDFs."),
+    input_dir: Path = typer.Option(
+        None, "--input", "-i", help="Folder of PDFs, or one PDF."
+    ),
     library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
     recursive: bool = typer.Option(None, "--recursive", "-r"),
     page_cutoff: int = typer.Option(None, "--page-cutoff", "-p"),
@@ -125,7 +127,13 @@ def ingest(
         help="preview (default), copy to leave the source in place, or move.",
     ),
 ) -> None:
-    """Read every not-yet-known document and file it into the library."""
+    """Read every not-yet-known document and file it into the library.
+
+    `--input` takes a folder or a single PDF, so one document can be filed
+    without putting it in a folder of its own first, and without the rest of the
+    folder it happens to sit in coming along with it.
+    """
+    _check_input(input_dir)
     settings, client = _build(
         input_dir, library_dir, recursive, page_cutoff, batch_size, model
     )
@@ -152,6 +160,33 @@ def ingest(
 
     if report.failed:
         raise typer.Exit(code=1)
+
+
+def _check_input(path: Path | None) -> None:
+    """Refuse an `--input` that offers no documents, saying which way it is wrong.
+
+    `discover_pdfs` answers a path that is neither a folder nor a PDF with an
+    empty list, deliberately: it runs on every pass of a long-lived watcher, and
+    a folder deleted underneath one must not take the service down. But the same
+    silence answers a typo with "filed 0 document(s)", which reads as "nothing
+    new here" — so a path typed by hand is checked here, where it was typed.
+    """
+    if path is None:
+        return
+    expanded = path.expanduser()
+    if expanded.is_dir():
+        return
+    if expanded.is_file():
+        if expanded.suffix.lower() == ".pdf":
+            return
+        typer.echo(
+            f"error: --input {path} is a {expanded.suffix or 'suffixless'} file; "
+            "this files PDFs. Name the folder to file what is in it.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    typer.echo(f"error: --input {path} is not a folder or a PDF", err=True)
+    raise typer.Exit(code=2)
 
 
 @app.command()

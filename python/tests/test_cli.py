@@ -1337,3 +1337,41 @@ def test_reading_a_document_whose_file_is_gone_says_so(library) -> None:
 
     assert result.exit_code == 1
     assert "missing from the store" in result.stderr
+
+
+# ---- what --input may name ---------------------------------------------------
+
+
+def test_a_non_pdf_input_is_refused_rather_than_filing_nothing(tmp_path) -> None:
+    """"filed 0 document(s)" reads as "nothing new here", not as a typo."""
+    from typer.testing import CliRunner
+
+    from sortyourpaperya.cli import app
+
+    notes = tmp_path / "notes.txt"
+    notes.write_text("not a pdf", encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["ingest", "--input", str(notes)])
+
+    assert result.exit_code == 2
+    assert "--input" in result.stderr and ".txt" in result.stderr
+
+
+def test_an_input_that_is_not_there_is_refused(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from sortyourpaperya.cli import app
+
+    result = CliRunner().invoke(app, ["ingest", "--input", str(tmp_path / "gone")])
+
+    assert result.exit_code == 2
+    assert "not a folder or a PDF" in result.stderr
+
+
+def test_a_pdf_and_a_folder_both_pass_the_check(tmp_path) -> None:
+    """The check refuses; deciding there is nothing to file is ingest's job."""
+    from sortyourpaperya.cli import _check_input
+
+    _check_input(tmp_path)
+    _check_input(write_pdf(tmp_path / "a.pdf", "attention"))
+    _check_input(None)

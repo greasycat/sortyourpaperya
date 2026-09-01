@@ -711,6 +711,7 @@ you will actually type.
 sortyourpaperya ingest --input ./inbox                 # preview: nothing is written
 sortyourpaperya ingest --input ./inbox --mode copy     # copy in, leave the source alone
 sortyourpaperya ingest --input ./inbox --mode move     # move in, draining the source
+sortyourpaperya ingest --input ./paper.pdf --mode copy # or one document by name
 sortyourpaperya watch  --input ./inbox --mode copy     # keep doing it as documents arrive
 
 sortyourpaperya list                              # what the library holds
@@ -750,6 +751,14 @@ sortyourpaperya cache [--forget]                  # model answers already paid f
 Nothing is written without `--mode`. Use `copy` for a folder you did not create
 — a Downloads folder keeps its files and the library gets copies. Re-run `wire`
 after changing dependencies.
+
+`--input` takes a folder or a single PDF, so one document can be filed without
+first putting it in a folder of its own and without the rest of the folder it
+sits in coming along. Naming a file that is not a PDF, or a path that is not
+there, is refused outright: the scan behind `--input` answers an unusable path
+with an empty list — deliberately, since a folder deleted under a running
+watcher must not take the service down — and that same silence would otherwise
+answer a typo with "filed 0 document(s)", which reads as "nothing new here".
 
 ## The registry
 
