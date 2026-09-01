@@ -53,7 +53,7 @@ Each record looks like this:
 }
 ```
 
-`document` is the file — open it to read the document. `id` is what every
+`document` is the file. `id` is what every
 other command takes. Those commands accept words too, but **pass the id you got
 from `find`**: a word matching two documents is an error you then have to
 resolve, and the id you already have cannot be ambiguous. `from_page_images: true` means the title, authors and year
@@ -81,6 +81,34 @@ hand.
 Both commands, and the ones below, take `--library <path>` when the user names a
 library. Without it `sortyourpaperya` resolves the one this machine watches, which is
 usually right.
+
+## Read it
+
+```bash
+sortyourpaperya read 5112ee75ddcf                 # the whole document, on stdout
+sortyourpaperya read 5112ee75ddcf --pages 1       # just the first page
+sortyourpaperya read 5112ee75ddcf --pages 4-9     # a range
+```
+
+The document's text, extracted from its text layer. Free and local — no request
+is sent and nothing is spent — so read the document rather than guessing from
+its title and keywords whenever a question is about what it actually says.
+
+**Check the length before reading a long one.** The record's `pages_read` is
+what the model looked at, not how long the document is; `read --pages 1` returns
+the first page and tells you the total on stderr. A 300-page manual read whole
+will fill your context with pages nobody asked about — use a range.
+
+Stdout is only the text, so `sortyourpaperya read <id> | grep -i "method"` works
+for finding a passage without reading the whole thing.
+
+A scanned document has no text layer. If ingest has already paid to have its
+pages read, that reading is printed and stderr says so — treat it as a model's
+reading of a picture rather than the document's own words, and say so if it
+matters. If nothing has read it, the command says that too; do not run `ingest`
+to fix it, because that spends money.
+
+Only the text layer. There is no OCR and no figure extraction here.
 
 ## Record something about it
 
@@ -227,10 +255,10 @@ The commands above cover the questions worth having a command for. This is the
 rest of the database, and it is a lot: `papers` (with `content_hash`,
 `size_bytes`, `pages_read`, `stored_mtime_ms`, `created_at_ms`,
 `updated_at_ms`), `paper_tags`, `paper_authors`, `paper_keywords`,
-`paper_attributes`, and `model_answers` — whose `page_text` column holds the
-text already extracted from each document's first pages. Reading that is free
-and already paid for; re-parsing the PDF to answer a question about its
-contents is not.
+`paper_attributes`, and `model_answers` — whose `page_text` column holds what
+a model read off the pages of a document that had no text layer. That is only
+scans, and `sortyourpaperya read` already hands it to you: for a document's
+contents, use `read`, not a query.
 
 `DESCRIBE papers` shows the columns of any of them. Join on `file_id`, except
 `model_answers`, which is keyed by `content_hash`.

@@ -346,6 +346,36 @@ Nothing is written until you accept, and the database is let go before the first
 request: the exchange waits on a person, and holding the write lock across that
 would stop the watcher.
 
+## Reading a document
+
+```bash
+sortyourpaperya read kahn                  # the whole thing, on stdout
+sortyourpaperya read kahn --pages 1        # just the first page
+sortyourpaperya read kahn --pages 4-9      # a range
+sortyourpaperya read kahn --pages 10-      # the rest of it, however long
+```
+
+The text goes to stdout and nothing else does, so it pipes and substitutes.
+What was read — which pages, out of how many — goes to stderr, because a
+reader who got pages 1 to 5 of 300 should not have to work that out.
+
+A range past the end is clipped rather than refused: `--pages 10-` means the
+rest whatever its length. A *first* page past the end is an error, since an
+empty answer would read as a document with nothing in it.
+
+Layout is kept as the page has it, which is the difference between this and
+what ingest reads. Ingest collapses the first pages to one line because a
+request pays by the character; a reader wants the lines the document has.
+Nothing is sent anywhere and nothing is spent: this is `pypdf` on a local file.
+
+A scan has no text to extract. Where ingest has already paid to have its pages
+read, that reading is printed instead and stderr says so — it is the document's
+own words in one case and a model's reading of a picture in the other, and
+nothing downstream can tell them apart afterwards. A scan nobody has read yet
+says so, and says that `sortyourpaperya ingest` is what reads one.
+
+Only what the text layer holds. OCR and figures are not done here.
+
 ## Notes
 
 ```bash
@@ -688,6 +718,8 @@ sortyourpaperya list --json                       # ...as records, for a program
 sortyourpaperya list --sort recent                # id (default), recent, updated, title, year, size
 sortyourpaperya find "attention 2017"             # by title, author, keyword, tag, year, or id
 sortyourpaperya categories                        # every category in use, and how many are under it
+sortyourpaperya read <id>                         # the document's text, on stdout
+sortyourpaperya read <id> --pages 1-5             # ...a range of it
 sortyourpaperya attr <id>                         # free key/value pairs kept on a document
 sortyourpaperya attr <id> doi 10.1000/xyz         # ...set one; --unset forgets it
 sortyourpaperya sql "SELECT ..."                  # the database directly, reading only

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FailingLlmClient, FakeLlmClient
+from conftest import FailingLlmClient, FakeLlmClient, write_pdf, write_scanned_pdf
 from sortyourpaperya.cli import LOG_BACKUP_COUNT, LOG_MAX_BYTES, _configure
 
 
@@ -1195,3 +1195,145 @@ def test_a_note_on_something_the_bibliography_does_not_cite_says_so(library) -> 
 
     assert result.exit_code == 1
     assert "does not cite" in result.stderr and "bib add" in result.stderr
+
+
+# ---- reading a document ------------------------------------------------------
+
+
+def _readable(library, pages: int = 3):
+    """A filed document with a real multi-page PDF behind it."""
+    from pypdf import PdfReader, PdfWriter
+
+    from sortyourpaperya.db import Paper
+
+    paper = Paper(
+        file_id="78c64b3b8ef6",
+        content_hash="sha-manual",
+        store_name="78c64b3b8ef6__Manuals",
+        document_name="acme_2024_manual.pdf",
+        title="Acme Manual",
+        year=2024,
+        tags=["Manuals"],
+    )
+    library.db.upsert(paper)
+    folder = library.document_dir(paper)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    writer = PdfWriter()
+    for number in range(1, pages + 1):
+        writer.append(
+            PdfReader(str(write_pdf(folder / f"src{number}.pdf", f"page {number} here")))
+        )
+    writer.write(str(folder / paper.document_name))
+    for number in range(1, pages + 1):
+        (folder / f"src{number}.pdf").unlink()
+
+    root = library.root
+    library.close()
+    return root, paper
+
+
+def test_read_prints_the_document_and_nothing_else_on_stdout(library) -> None:
+    """So `sortyourpaperya read <id> | grep` and `$(...)` both work."""
+    root, paper = _readable(library)
+
+    result = _invoke(root, "read", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "page 1 here" in result.stdout and "page 3 here" in result.stdout
+    assert "pages 1-3 of 3" in result.stderr
+    assert "pages 1-3 of 3" not in result.stdout
+
+
+def test_read_takes_a_page_range(library) -> None:
+    root, _ = _readable(library)
+
+    result = _invoke(root, "read", "acme", "--pages", "2-3")
+
+    assert result.exit_code == 0, result.output
+    assert "page 1 here" not in result.stdout
+    assert "page 2 here" in result.stdout and "page 3 here" in result.stdout
+    assert "pages 2-3 of 3" in result.stderr
+
+
+def test_an_open_ended_range_is_the_rest_of_it(library) -> None:
+    root, _ = _readable(library)
+
+    result = _invoke(root, "read", "acme", "--pages", "2-")
+
+    assert result.exit_code == 0, result.output
+    assert "page 3 here" in result.stdout and "page 1 here" not in result.stdout
+
+
+def test_a_range_that_names_no_pages_is_a_usage_error(library) -> None:
+    """Naming the option, not something surfacing from inside pypdf."""
+    root, _ = _readable(library)
+
+    for bad in ("two", "5-2", "0"):
+        result = _invoke(root, "read", "acme", "--pages", bad)
+        assert result.exit_code == 2, bad
+        assert "--pages" in result.stderr
+
+
+def test_reading_a_scan_nothing_has_read_says_what_would(library) -> None:
+    from sortyourpaperya.db import Paper
+
+    paper = Paper(
+        file_id="aa11bb22cc33",
+        content_hash="sha-scan",
+        store_name="aa11bb22cc33__Scans",
+        document_name="scan.pdf",
+        title="A Scanned Report",
+        tags=["Scans"],
+    )
+    library.db.upsert(paper)
+    folder = library.document_dir(paper)
+    folder.mkdir(parents=True, exist_ok=True)
+    write_scanned_pdf(folder / paper.document_name)
+    root = library.root
+    library.close()
+
+    result = _invoke(root, "read", paper.file_id)
+
+    assert result.exit_code == 1
+    assert "no text layer" in result.stderr and "ingest" in result.stderr
+
+
+def test_a_scan_the_model_has_read_prints_that_reading_and_says_so(library) -> None:
+    """It is a model's reading of a picture, not the document's own words."""
+    from sortyourpaperya.db import ModelAnswer, Paper
+
+    paper = Paper(
+        file_id="aa11bb22cc33",
+        content_hash="sha-scan",
+        store_name="aa11bb22cc33__Scans",
+        document_name="scan.pdf",
+        title="A Scanned Report",
+        pages_read=2,
+        tags=["Scans"],
+    )
+    library.db.upsert(paper)
+    folder = library.document_dir(paper)
+    folder.mkdir(parents=True, exist_ok=True)
+    write_scanned_pdf(folder / paper.document_name)
+    library.db.remember_model_answers(
+        [ModelAnswer(content_hash="sha-scan", page_text="A report about scanned things.")]
+    )
+    root = library.root
+    library.close()
+
+    result = _invoke(root, "read", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "A report about scanned things." in result.stdout
+    assert "no text layer; a model's reading of its first 2 page(s)" in result.stderr
+
+
+def test_reading_a_document_whose_file_is_gone_says_so(library) -> None:
+    root, paper = _readable(library)
+    (root / "store" / paper.store_name / paper.document_name).unlink()
+
+    result = _invoke(root, "read", paper.file_id)
+
+    assert result.exit_code == 1
+    assert "missing from the store" in result.stderr

@@ -27,7 +27,9 @@ from .config import (
     resolve_api_key,
     resolve_settings,
 )
+from . import extract
 from .db import SORTS, Paper
+from .extract import ExtractionError
 from .ingest import ingest_folder
 import os
 import shutil
@@ -492,6 +494,116 @@ def _prompt(text: str, default: str = "") -> str:
         # the exception a closed stdin raises.
         typer.echo("\ncancelled; nothing changed")
         raise typer.Exit(code=0) from None
+
+
+@app.command("read")
+def read_document(
+    file_id: str = typer.Argument(..., help="Document id, or words from its title, authors, or keywords."),
+    pages: str = typer.Option(
+        None, "--pages", help="Which pages, e.g. '3', '4-9', or '10-'. Default: all of them."
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Print a filed document's text.
+
+    The text goes to stdout and nothing else does, so `sortyourpaperya read <id>
+    | grep` and `$(sortyourpaperya read <id>)` both work. What was read — which
+    pages, out of how many — goes to stderr, because a document is long and a
+    reader who got pages 1 to 5 of 300 should not have to notice on their own.
+
+    A `--pages` range is how you read a book without reading a book. It is
+    clipped to the document rather than refused, so `--pages 10-` is the rest of
+    it however long it turns out to be.
+
+    Layout is kept as the page has it. That is the difference between this and
+    what ingest reads: a request pays by the character and wants one line, where
+    a reader wants the lines the document has.
+
+    A scanned document has no text to extract. Where the model has already read
+    its pages — which ingest pays for once and banks — that reading is printed
+    instead, and stderr says so: it is the document's own words in the one case
+    and a model's reading of a picture in the other, and nothing downstream can
+    tell them apart afterwards.
+    """
+    first, last = _pages(pages)
+    settings = _settings(None, library_dir)
+    with Library(settings.output_dir) as library:
+        paper = _resolve(library, file_id)
+        path = library.store_path(paper)
+        if not path.is_file():
+            typer.echo(
+                f"error: {paper.store_name} is missing from the store", err=True
+            )
+            raise typer.Exit(code=1)
+        try:
+            document = extract.read_document(path, first, last)
+        except ExtractionError as err:
+            typer.echo(f"error: {err}", err=True)
+            raise typer.Exit(code=1) from err
+
+        if document.has_text_layer:
+            text = document.text
+            notice = f"{_read_range(document)} of {document.total_pages}"
+        else:
+            banked = library.db.model_answers(
+                [paper.content_hash], max_age_ms=None
+            ).get(paper.content_hash)
+            text = (banked.page_text or "").strip() if banked else ""
+            # Deliberately not a page range. The banked text is one answer
+            # covering the pages ingest looked at, not a page each, so there is
+            # no page 3 of it to hand back and claiming otherwise would invite
+            # a quote attributed to a page nobody read.
+            covered = paper.pages_read or 0
+            notice = (
+                "no text layer; a model's reading of its first "
+                f"{covered} page(s)" if covered else
+                "no text layer; a model's reading of its pages"
+            )
+            if pages:
+                typer.echo(
+                    f"  --pages {pages} does not apply to a model's reading", err=True
+                )
+
+    if not text:
+        typer.echo(
+            f"error: {paper.file_id} has no text layer, and nothing has read its "
+            "pages. `sortyourpaperya ingest` reads a scan, and costs a request.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(text)
+    typer.echo(notice, err=True)
+
+
+def _read_range(document: "extract.DocumentText") -> str:
+    last = document.first_page + len(document.pages) - 1
+    if len(document.pages) == 1:
+        return f"page {document.first_page}"
+    return f"pages {document.first_page}-{last}"
+
+
+def _pages(text: str | None) -> tuple[int, int | None]:
+    """A `--pages` range as first and last, where last may be open.
+
+    Refused at the CLI, where the input arrives, so a typo is a usage error
+    naming the option rather than something surfacing from inside pypdf.
+    """
+    if not text:
+        return 1, None
+    first, dash, last = text.strip().partition("-")
+    try:
+        start = int(first)
+        end = None if (dash and not last.strip()) else int(last or first)
+    except ValueError:
+        typer.echo(
+            f"error: --pages takes '3', '4-9', or '10-', not {text!r}", err=True
+        )
+        raise typer.Exit(code=2) from None
+    if start < 1 or (end is not None and end < start):
+        typer.echo(f"error: --pages {text!r} names no pages", err=True)
+        raise typer.Exit(code=2)
+    return start, end
 
 
 @app.command()
