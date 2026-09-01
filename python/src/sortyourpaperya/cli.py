@@ -12,6 +12,8 @@ from typing import Sequence
 
 import typer
 
+from . import bib as bibs
+from .bib import BibError, Bibliography
 from .budget import Budget
 from .config import (
     MAX_STEERING_CATEGORIES,
@@ -564,6 +566,204 @@ def note(
         typer.echo(path)
 
 
+bib_app = typer.Typer(
+    help="Bibliographies: what you cite, and the .bib LaTeX reads.",
+    no_args_is_help=True,
+)
+app.add_typer(bib_app, name="bib")
+
+
+@bib_app.command("init")
+def bib_init(
+    name: str = typer.Argument(..., help="What the bibliography is called, e.g. 'PhD Thesis'."),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Start a new bibliography under the library's `bibs/` folder.
+
+    A library holds as many as its owner writes papers: one per manuscript,
+    keeping its own citation keys, so a key disambiguated in one does not
+    change under another's feet. The folder is named by the slug of `name`, and its
+    `bib.toml` records the name as given.
+    """
+    settings = _settings(None, library_dir)
+    try:
+        bibliography = bibs.create(settings.output_dir, name)
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    typer.echo(f"{bibliography.slug}  {bibliography.id}  {bibliography.name}")
+    typer.echo(f"  record  {bibliography.record_path}")
+    typer.echo(f"  bib     {bibliography.bib_path}")
+
+
+@bib_app.command("list")
+def bib_list(
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print records instead of a table, for a program to read."
+    ),
+) -> None:
+    """Every bibliography in the library, with its slug, id, and size."""
+    settings = _settings(None, library_dir)
+    found = bibs.all_bibs(settings.output_dir)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                [
+                    {
+                        "id": entry.id,
+                        "slug": entry.slug,
+                        "name": entry.name,
+                        "sources": len(entry.sources),
+                        "path": str(entry.path),
+                        "bib": str(entry.bib_path),
+                        "created_at": _timestamp(entry.created_at_ms),
+                    }
+                    for entry in found
+                ],
+                indent=2,
+            )
+        )
+        return
+    if not found:
+        typer.echo("no bibliographies yet; `sortyourpaperya bib init <name>` starts one")
+        return
+    for entry in found:
+        typer.echo(
+            f"{entry.slug:<24}  {entry.id}  {len(entry.sources):>4} source(s)  {entry.name}"
+        )
+
+
+@bib_app.command("add")
+def bib_add(
+    lib: str = typer.Option(
+        None, "--lib", help="Which bibliography, by slug or id. Asked for if left out."
+    ),
+    cite: str = typer.Option(
+        None,
+        "--cite",
+        help="The document to cite: its id, or words from it. Asked for if left out.",
+    ),
+    entry_type: str = typer.Option(
+        None, "--type", help="BibTeX entry type. Worked out from the fields if left out."
+    ),
+    key: str = typer.Option(
+        None, "--key", help="Citation key. Built from author, year, and title if left out."
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Cite one of the library's documents in one of its bibliographies.
+
+    Either half may be left off and is asked for: which bibliography, and which
+    document. The document is named the way every other command names one — an
+    id, or words from its title, authors, or keywords.
+
+    Title, authors, and year come from the library; a DOI, a journal, a page
+    range, and the rest come from the document's attributes, which is where
+    `sortyourpaperya attr` puts what the model was never asked for. What the
+    library does not know is added by editing `bib.toml` and running
+    `sortyourpaperya bib build`.
+    """
+    settings = _settings(None, library_dir)
+
+    # Both questions are asked before the database is opened. They wait on a
+    # person, and holding the write lock across that would stop the watcher,
+    # which waits 30 seconds and then fails.
+    bibliography = _pick_bib(settings.output_dir, lib)
+    needle = cite or _prompt("which document? (id, or words from it)")
+
+    with Library(settings.output_dir) as library:
+        paper = _resolve(library, needle)
+
+        already = bibliography.source_for(paper.file_id)
+        if already is not None:
+            # Not an error: the document is cited, which is what was asked for.
+            typer.echo(
+                f"{paper.file_id} is already in {bibliography.slug} as {already.key}"
+            )
+            return
+
+        source = bibs.source_from_paper(
+            paper,
+            library.db.attributes(paper.file_id),
+            entry_type=entry_type,
+            key=key,
+        )
+
+    written = bibliography.add(source)
+    try:
+        bibliography.save()
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    typer.echo(f"{written.key}  @{written.entry_type}  {_label(paper)}")
+    if key and written.key != key:
+        typer.echo(f"  {key!r} was taken; cited as {written.key}", err=True)
+    typer.echo(f"  {bibliography.bib_path}")
+
+
+@bib_app.command("build")
+def bib_build(
+    lib: str = typer.Option(
+        None, "--lib", help="Which bibliography, by slug or id. Asked for if left out."
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Regenerate a bibliography's `.bib` from its `bib.toml`.
+
+    The TOML is the record and the `.bib` is a projection of it, so this is what
+    you run after editing the TOML by hand — to correct a title, to add a
+    journal the library never knew. Nothing in the `.bib` survives it.
+    """
+    settings = _settings(None, library_dir)
+    bibliography = _pick_bib(settings.output_dir, lib)
+    try:
+        bibliography.save()
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+    typer.echo(
+        f"wrote {len(bibliography.sources)} entr"
+        f"{'y' if len(bibliography.sources) == 1 else 'ies'} to {bibliography.bib_path}"
+    )
+
+
+def _pick_bib(library_root: Path, needle: str | None) -> Bibliography:
+    """The bibliography a command should write to, asking when it was not told.
+
+    Named ones are looked up and never guessed at. Unnamed, the choices are
+    printed and one is asked for, with the first offered as the default — so a
+    library with a single bibliography takes one keystroke, and a library with
+    several cannot have the wrong one picked for it.
+    """
+    if needle:
+        try:
+            return bibs.open_bib(library_root, needle)
+        except BibError as err:
+            typer.echo(f"error: {err}", err=True)
+            raise typer.Exit(code=1) from err
+
+    found = bibs.all_bibs(library_root)
+    if not found:
+        typer.echo(
+            "error: this library has no bibliography yet; "
+            "`sortyourpaperya bib init <name>` starts one",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    for entry in found:
+        typer.echo(f"  {entry.slug:<24}  {entry.id}  {entry.name}", err=True)
+    answer = _prompt("which bibliography? (slug or id)", default=found[0].slug)
+    try:
+        return bibs.open_bib(library_root, answer)
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+
 @app.command("migrate-store")
 def migrate_store(
     library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
@@ -723,6 +923,9 @@ def backup(
     typer.echo(f"backed up {report.documents} document(s) to {report.destination}")
     typer.echo(f"  database  {report.database.name}")
     typer.echo(f"  store     {report.bytes_copied / 1e6:.1f} MB")
+    if report.bibliographies:
+        plural = "y" if report.bibliographies == 1 else "ies"
+        typer.echo(f"  bibs      {report.bibliographies} bibliograph{plural}")
     typer.echo("  the tree is not copied; `sortyourpaperya tree` rebuilds it")
 
 

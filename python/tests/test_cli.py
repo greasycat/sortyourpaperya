@@ -891,3 +891,188 @@ def test_sql_says_when_it_capped_the_rows(library) -> None:
     result = _invoke(root, "sql", "SELECT title FROM papers", "--limit", "1")
 
     assert "more than 1 rows matched" in result.output
+
+
+# ---- bibliographies ---------------------------------------------------------
+
+
+def _cited(library, **overrides):
+    """A filed document worth citing, with a DOI a reader put on it."""
+    from sortyourpaperya.db import Paper
+
+    fields = {
+        "file_id": "78c64b3b8ef6",
+        "content_hash": "sha-vaswani",
+        "store_name": "78c64b3b8ef6__AI",
+        "document_name": "vaswani_2017_attention.pdf",
+        "title": "Attention Is All You Need",
+        "authors": ["Ashish Vaswani"],
+        "year": 2017,
+        "tags": ["AI"],
+    }
+    fields.update(overrides)
+    paper = Paper(**fields)
+    library.db.upsert(paper)
+    library.db.set_attribute(paper.file_id, "doi", "10.1000/xyz")
+    root = library.root
+    library.close()
+    return root, paper
+
+
+def test_bib_init_makes_a_bibliography_and_says_where(library) -> None:
+    root = library.root
+    library.close()
+
+    result = _invoke(root, "bib", "init", "PhD Thesis")
+
+    assert result.exit_code == 0, result.output
+    assert "phd-thesis" in result.stdout
+    assert (root / "bibs" / "phd-thesis" / "bib.toml").is_file()
+    assert (root / "bibs" / "phd-thesis" / "references.bib").is_file()
+
+
+def test_bib_add_told_both_halves_writes_the_entry(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    written = (root / "bibs" / "thesis" / "references.bib").read_text()
+    assert "@misc{vaswani2017attention," in written
+    # The DOI a reader put on the document, which the model was never asked for.
+    assert "doi = {10.1000/xyz}," in written
+
+
+def test_bib_add_names_the_document_by_words(library) -> None:
+    """The same way every other command names one."""
+    root, _ = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", "vaswani")
+
+    assert result.exit_code == 0, result.output
+    assert "vaswani2017attention" in result.stdout
+
+
+def test_bib_add_asks_for_whichever_half_it_was_not_given(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "init", "Paper")
+
+    # Two bibliographies, so neither can be picked without being asked for.
+    result = _invoke(root, "bib", "add", input=f"thesis\n{paper.file_id}\n")
+
+    assert result.exit_code == 0, result.output
+    assert "thesis" in result.stderr and "paper" in result.stderr
+    assert "@misc{vaswani2017attention," in (
+        root / "bibs" / "thesis" / "references.bib"
+    ).read_text()
+
+
+def test_the_only_bibliography_is_offered_as_the_default(library) -> None:
+    """One keystroke when there is only one, and still never a silent guess."""
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--cite", paper.file_id, input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "vaswani2017attention" in result.stdout
+
+
+def test_citing_a_document_twice_changes_nothing(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "already in thesis as vaswani2017attention" in result.stdout
+    written = (root / "bibs" / "thesis" / "references.bib").read_text()
+    assert written.count("@misc{") == 1
+
+
+def test_bib_add_without_a_bibliography_says_how_to_make_one(library) -> None:
+    root, paper = _cited(library)
+
+    result = _invoke(root, "bib", "add", "--cite", paper.file_id)
+
+    assert result.exit_code == 1
+    assert "bib init" in result.stderr
+
+
+def test_an_unknown_bibliography_is_refused_rather_than_guessed_at(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--lib", "nope", "--cite", paper.file_id)
+
+    assert result.exit_code == 1
+    assert "no bibliography" in result.stderr
+
+
+def test_bib_build_regenerates_the_bib_from_a_hand_edited_record(library) -> None:
+    """The TOML is the record; this is what makes editing it the way to work."""
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    record = root / "bibs" / "thesis" / "bib.toml"
+    record.write_text(record.read_text().replace('type = "misc"', 'type = "article"'))
+    result = _invoke(root, "bib", "build", "--lib", "thesis")
+
+    assert result.exit_code == 0, result.output
+    assert "@article{vaswani2017attention," in (
+        root / "bibs" / "thesis" / "references.bib"
+    ).read_text()
+
+
+def test_bib_list_says_what_the_library_has(library) -> None:
+    import json
+
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    result = _invoke(root, "bib", "list", "--json")
+
+    (entry,) = json.loads(result.stdout)
+    assert entry["slug"] == "thesis" and entry["sources"] == 1
+    assert entry["bib"].endswith("references.bib")
+
+
+def test_bib_list_of_an_empty_library_says_how_to_start_one(library) -> None:
+    root = library.root
+    library.close()
+
+    result = _invoke(root, "bib", "list")
+
+    assert result.exit_code == 0
+    assert "bib init" in result.stdout
+
+
+def test_bib_add_asks_before_it_opens_the_database(library, monkeypatch) -> None:
+    """Both questions wait on a person, and the write lock must not wait with them.
+
+    DuckDB admits one writing process, so a prompt held open across the lock
+    stops the watcher, which waits 30 seconds and then fails. So the order is
+    the contract: everything that asks happens before anything that opens.
+    """
+    from sortyourpaperya import cli
+
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    order: list[str] = []
+    ask, open_library = cli._prompt, cli.Library
+    monkeypatch.setattr(cli, "_prompt", lambda *a, **k: order.append("asked") or ask(*a, **k))
+    monkeypatch.setattr(
+        cli, "Library", lambda *a, **k: order.append("opened") or open_library(*a, **k)
+    )
+
+    result = _invoke(root, "bib", "add", input=f"thesis\n{paper.file_id}\n")
+
+    assert result.exit_code == 0, result.output
+    assert order == ["asked", "asked", "opened"]

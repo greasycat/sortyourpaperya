@@ -10,6 +10,9 @@ The **link name** is what the symlink tree shows: `author_year_title.pdf` when
 the pieces are known, and the store name when they are not, so a link always has
 a name even for a paper nothing is known about.
 
+The **citation key** is what a bibliography cites a document by:
+`vaswani2017attention`. Same three pieces, spelled the way BibTeX wants them.
+
 The database is authoritative for tags. These names are a readable projection of
 it, which is what lets long tag lists be truncated to fit a filesystem without
 losing anything.
@@ -34,14 +37,24 @@ MAX_TITLE_SLUG_CHARS = 72
 # leaving room for a `.pdf` suffix and a disambiguating id.
 MAX_NAME_CHARS = 200
 
+# Words that name nothing, and so are skipped when a title has to supply the
+# one word a citation key carries.
+KEY_STOP_WORDS = frozenset(
+    {"a", "an", "and", "for", "from", "in", "of", "on", "the", "to", "with"}
+)
+
 _ALLOWED_TAG = re.compile(r"[^A-Za-z0-9 -]+")
 _ALLOWED_SLUG = re.compile(r"[^a-z0-9-]+")
 _DASH_RUN = re.compile(r"-{2,}")
 _SPACE_RUN = re.compile(r"\s+")
 
 
-def new_paper_id() -> str:
-    """A fresh permanent id for a paper: 12 hex characters of a UUID4."""
+def new_id() -> str:
+    """A fresh permanent id: 12 hex characters of a UUID4.
+
+    Papers and bibliographies are both named by one. They live in separate
+    namespaces, so the same generator serves both.
+    """
     return uuid.uuid4().hex[:PAPER_ID_CHARS]
 
 
@@ -113,7 +126,7 @@ def link_name(
     rather than being called `2017.pdf`.
     """
     author = _first_author_surname(authors or [])
-    slug = _truncate_words(_slugify(title or ""), MAX_TITLE_SLUG_CHARS)
+    slug = _truncate_words(slugify(title or ""), MAX_TITLE_SLUG_CHARS)
     if not (author or slug):
         return fallback
 
@@ -130,6 +143,41 @@ def disambiguate(name: str, paper_id: str) -> str:
     if not dot:
         return f"{name}_{paper_id}"
     return f"{stem}_{paper_id}.{suffix}"
+
+
+def cite_key(
+    *,
+    fallback: str,
+    authors: list[str] | None = None,
+    year: int | None = None,
+    title: str | None = None,
+) -> str:
+    """The key a bibliography cites a document by: `vaswani2017attention`.
+
+    Author surname, year, and the first word of the title that names something.
+    It is the spelling nearly every reference manager produces, and so the one
+    someone will guess at when citing it. Whichever pieces are known are run
+    together; a document with none of them falls back to `fallback`, its id,
+    because an entry with no key is not an entry.
+
+    Dashes are dropped rather than kept: a hyphenated surname reads perfectly
+    well run together, and a stray dash is one more thing to remember about how
+    the key was spelled.
+
+    A year on its own names nothing, exactly as it does not for `link_name`, so
+    a document with neither an author nor a title falls back rather than being
+    cited as `2017`.
+    """
+    surname = _first_author_surname(authors or []).replace("-", "")
+    words = [word for word in slugify(title or "").split("-") if word]
+    first = next(
+        (word for word in words if word not in KEY_STOP_WORDS),
+        words[0] if words else "",
+    )
+    if not (surname or first):
+        return fallback
+    parts = [part for part in (surname, str(year) if year else "", first) if part]
+    return "".join(parts)
 
 
 def _truncate_words(slug: str, limit: int) -> str:
@@ -158,13 +206,14 @@ def _first_author_surname(authors: list[str]) -> str:
             continue
         # "Ashish Vaswani" -> vaswani; "Vaswani, Ashish" -> vaswani
         surname = cleaned.split(",")[0] if "," in cleaned else cleaned.split()[-1]
-        slug = _slugify(surname)
+        slug = slugify(surname)
         if slug:
             return slug
     return ""
 
 
-def _slugify(text: str) -> str:
+def slugify(text: str) -> str:
+    """Text as a lowercase, dash-separated, filename-safe slug."""
     folded = _ascii_fold(text).lower().replace("_", "-")
     slug = _ALLOWED_SLUG.sub("-", folded)
     return _DASH_RUN.sub("-", slug).strip("-")

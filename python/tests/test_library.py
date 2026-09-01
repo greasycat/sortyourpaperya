@@ -9,11 +9,11 @@ from conftest import write_pdf
 
 from sortyourpaperya.db import Paper
 from sortyourpaperya.library import FilingMode, Library, LibraryError
-from sortyourpaperya.naming import link_name, new_paper_id, store_name
+from sortyourpaperya.naming import link_name, new_id, store_name
 
 
 def _paper(tags: list[str], **overrides) -> Paper:
-    paper_id = overrides.pop("file_id", new_paper_id())
+    paper_id = overrides.pop("file_id", new_id())
     fields = {
         "file_id": paper_id,
         "content_hash": "hash-" + paper_id,
@@ -917,6 +917,21 @@ def test_a_backed_up_database_can_be_opened_on_its_own(
 
     with PaperDb(report.database) as restored:
         assert restored.get(paper.file_id) is not None
+
+
+def test_bibliographies_are_backed_up(library: Library, tmp_path: Path) -> None:
+    """A bibliography is hand-made and derivable from nothing.
+
+    Leaving it out would make this command the thing that loses it.
+    """
+    from sortyourpaperya import bib
+
+    bib.create(library.root, "Thesis")
+
+    report = library.backup(tmp_path / "backup")
+
+    assert (report.destination / "bibs" / "thesis" / "bib.toml").is_file()
+    assert report.bibliographies == 1
 
 
 def test_notes_kept_beside_a_document_are_backed_up(

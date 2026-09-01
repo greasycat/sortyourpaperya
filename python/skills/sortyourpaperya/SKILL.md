@@ -138,6 +138,37 @@ there is backed up with it, follows it when it is re-tagged, and is deleted with
 it. Nothing written into `tree/` is durable: it is rebuilt from the database and
 not backed up.
 
+## Cite it in a paper
+
+```bash
+sortyourpaperya bib list --json                                  # which bibliographies exist
+sortyourpaperya bib add --lib thesis --cite 5112ee75ddcf         # cite one document in one
+```
+
+A bibliography lives at `bibs/<slug>/` inside the library and holds two files:
+`bib.toml`, the record, and `references.bib`, generated from it — the one to
+point LaTeX at. `bib add` writes both. It reports the citation key it used,
+which is what goes inside `\cite{}`.
+
+**Always pass both `--lib` and `--cite`.** Either one left out is asked for at
+a prompt you cannot answer.
+
+Fill in what the entry needs *before* citing it, with `attr`: `doi`, `journal`,
+`booktitle`, `publisher`, `volume`, `number`, `pages`, `url`, and the rest of
+the BibTeX field names are carried into the entry, and the entry type follows
+from them — a document with a `journal` is an `@article`, one with a
+`booktitle` an `@inproceedings`, and one with neither `@misc`. Pass `--type` to
+say outright. Attributes that are not BibTeX field names stay out of the
+bibliography, so a verdict or a reading date is safe to keep on a document.
+
+To correct or add anything afterwards, edit `bib.toml` and run
+`sortyourpaperya bib build --lib <slug>`. **Never edit `references.bib`** — it
+is regenerated from the TOML and the next `bib add` overwrites it.
+
+Citing the same document twice does nothing and says so; it does not duplicate
+the entry. `sortyourpaperya bib init "<name>"` starts a new bibliography, one
+per manuscript.
+
 ## Re-file a document
 
 ```bash
@@ -194,6 +225,9 @@ fails intermittently and for a reason that has nothing to do with the question.
   `--yes` only after the user has said yes to that document, and only with an
   exact id — `--yes` refuses words, because what a word matches changes as the
   library grows.
+- `sortyourpaperya bib init` starts a bibliography and `bib add` edits one. Both
+  only write inside `bibs/`, but a bibliography is the user's manuscript:
+  run them when asked, not to tidy up.
 - `sortyourpaperya fsck`, `scan`, `tree`, `migrate-store`, and `backup` are maintenance.
   They are safe, but run them when asked, not speculatively.
 

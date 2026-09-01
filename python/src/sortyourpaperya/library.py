@@ -28,6 +28,7 @@ from typing import Sequence
 
 import duckdb
 
+from .bib import BIBS_DIR
 from .db import Paper, PaperDb
 from .discovery import file_id as hash_file
 from .naming import disambiguate, link_name, parse_store_name, store_name
@@ -79,6 +80,7 @@ class BackupReport:
     database: Path
     documents: int
     bytes_copied: int
+    bibliographies: int = 0
 
 
 @dataclass(frozen=True)
@@ -322,13 +324,17 @@ class Library:
         return report
 
     def backup(self, destination: Path) -> "BackupReport":
-        """Copy the library's two durable halves to `destination`.
+        """Copy everything durable in the library to `destination`.
 
         The store and the database are only useful together: the store without
         the database is a folder of documents nothing can find, and the database
         without the store is a catalogue of files that are gone. So they are
         copied by one command, in one place, rather than left as two things to
         remember.
+
+        `bibs/` goes with them. A bibliography is hand-made and derivable from
+        nothing, so leaving it out of the backup would make this command the
+        thing that loses it.
 
         **The database goes first.** Between the two copies a watcher may file
         another document, and which half is behind decides what the copy is
@@ -372,11 +378,23 @@ class Library:
             documents = sum(1 for entry in target.iterdir() if entry.is_dir())
             copied_bytes = _tree_bytes(target)
 
+        bibliographies = 0
+        bibs = self.root / BIBS_DIR
+        if bibs.is_dir():
+            try:
+                shutil.copytree(bibs, destination / BIBS_DIR)
+            except OSError as err:
+                raise LibraryError(f"could not copy the bibliographies: {err}") from err
+            bibliographies = sum(
+                1 for entry in (destination / BIBS_DIR).iterdir() if entry.is_dir()
+            )
+
         return BackupReport(
             destination=destination,
             database=destination / DB_FILE,
             documents=documents,
             bytes_copied=copied_bytes,
+            bibliographies=bibliographies,
         )
 
     def notes(self, paper: Paper) -> list[Path]:

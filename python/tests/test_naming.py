@@ -6,7 +6,7 @@ from sortyourpaperya.naming import (
     MAX_NAME_CHARS,
     disambiguate,
     link_name,
-    new_paper_id,
+    new_id,
     parse_store_name,
     sanitize_tag,
     split_category,
@@ -15,7 +15,7 @@ from sortyourpaperya.naming import (
 
 
 def test_store_name_round_trips_id_and_tags() -> None:
-    paper_id = new_paper_id()
+    paper_id = new_id()
 
     name = store_name(paper_id, ["Machine Learning", "Transformers"])
 
@@ -28,7 +28,7 @@ def test_a_tag_can_never_contain_the_separator() -> None:
     assert "_" not in sanitize_tag("deep__learning")
     assert "_" not in sanitize_tag("a_b_c")
 
-    paper_id = new_paper_id()
+    paper_id = new_id()
     name = store_name(paper_id, [sanitize_tag("deep__learning"), "Vision"])
 
     assert parse_store_name(name) == (paper_id, ["deep-learning", "Vision"])
@@ -43,7 +43,7 @@ def test_split_category_turns_a_model_path_into_ordered_tags() -> None:
 
 
 def test_tags_are_dropped_to_fit_the_filesystem_limit() -> None:
-    paper_id = new_paper_id()
+    paper_id = new_id()
     tags = [f"Category number {index}" for index in range(40)]
 
     name = store_name(paper_id, tags)

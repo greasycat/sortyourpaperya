@@ -141,7 +141,8 @@ sortyourpaperya backup ~/Backups/sortyourpaperya-2026-08-22
 
 The store and the database are only useful together — the store alone is a
 folder of documents nothing can find, the database alone is a catalogue of files
-that are gone — so one command copies both. `tree/` is skipped; `sortyourpaperya tree`
+that are gone — so one command copies both, along with `bibs/`, which is
+hand-made and derivable from nothing. `tree/` is skipped; `sortyourpaperya tree`
 rebuilds it.
 
 The database is copied first, and through DuckDB rather than as a file: a
@@ -171,6 +172,10 @@ library/
   tree/
     Machine Learning/Deep Learning/Transformers/
       vaswani_2017_attention-is-all-you-need -> ../../../store/5112ee75ddcf__...
+  bibs/
+    phd-thesis/
+      bib.toml              <- what you cite, and the file you edit
+      references.bib        <- generated from it, and the file LaTeX reads
 ```
 
 Every document has one home: a folder in the store holding the document and
@@ -210,6 +215,9 @@ under different names is recognised.
 
 Expanding the schema means appending to `_MIGRATIONS` in `db.py`; anything not
 worth a column yet goes in `paper_attributes` as a key/value pair.
+
+`bibs/` is durable in the same way the store is — hand-made, derivable from
+nothing — so `sortyourpaperya backup` copies it too.
 
 ## Scanned documents
 
@@ -357,6 +365,95 @@ Notes are just files in the folder, so anything else you put there — figures,
 supplements, a scanned appendix — gets the same treatment, minus being reported
 as a note. All of it is backed up with the document, follows it through a
 re-tag, and is deleted with it, which is why `sortyourpaperya remove` asks first.
+
+## Bibliographies
+
+A library keeps the papers you cite; `bib` keeps what you cite them in. One
+bibliography per manuscript, under `bibs/<slug>/`:
+
+```bash
+sortyourpaperya bib init "PhD Thesis"                       # bibs/phd-thesis/
+sortyourpaperya bib add --lib phd-thesis --cite 5112ee75ddcf
+```
+
+Leave off `--lib`, `--cite`, or both and you are asked, with the bibliographies
+listed and the first offered as the default — so a library with one takes a
+keystroke, and a library with several cannot have the wrong one picked for it.
+A bibliography answers to its slug or to its id, so a script that recorded the
+id keeps working across a rename.
+
+Each one holds two files:
+
+```toml
+# bibs/phd-thesis/bib.toml — the record, and the one you edit
+id = "add9918a7e03"
+slug = "phd-thesis"
+name = "PhD Thesis"
+
+[[source]]
+key = "vaswani2017attention"
+type = "article"
+file_id = "5112ee75ddcf"
+title = "Attention Is All You Need"
+author = ["Ashish Vaswani", "Noam Shazeer"]
+year = 2017
+doi = "10.48550/arXiv.1706.03762"
+journal = "NeurIPS"
+```
+
+```bibtex
+% bibs/phd-thesis/references.bib — generated from it, and the one LaTeX reads
+@article{vaswani2017attention,
+  title = {{Attention Is All You Need}},
+  author = {Ashish Vaswani and Noam Shazeer},
+  year = {2017},
+  doi = {10.48550/arXiv.1706.03762},
+  journal = {NeurIPS},
+}
+```
+
+**The TOML is the source of truth and the `.bib` is a projection of it**, the
+same way the database is the truth behind the store's filenames. So a field the
+library never knew — a page range, a corrected title, a source that is not in
+the library at all — is added by editing `bib.toml` and running
+`sortyourpaperya bib build`. Nothing you write into `references.bib` survives
+the next write; the file says so in its own header.
+
+Every key in a `[[source]]` table except `key`, `type`, `file_id`, and
+`added_at_ms` is a BibTeX field, carried through as written, so the record can
+hold a field this tool has never heard of.
+
+Title, authors, and year come from the library's own columns. Everything else
+comes from the document's attributes, so this is what `sortyourpaperya attr`
+is for:
+
+```bash
+sortyourpaperya attr 5112ee75ddcf doi 10.48550/arXiv.1706.03762
+sortyourpaperya attr 5112ee75ddcf journal NeurIPS
+```
+
+Only attribute keys that name a BibTeX field are carried across — `doi`,
+`journal`, `booktitle`, `publisher`, `volume`, `pages`, `url` and the rest — so
+a verdict or a reading date kept on the same document stays out of the
+bibliography. The entry type follows from what is there: a `journal` makes it
+an `@article`, a `booktitle` an `@inproceedings`, a `school` a `@phdthesis`,
+and nothing at all leaves it `@misc`, since a document filed by this tool is
+not assumed to be a paper. `--type` overrules all of it.
+
+The citation key is `vaswani2017attention` — surname, year, and the first word
+of the title that names something, which is the spelling nearly every reference
+manager produces and so the one you will guess at when typing `\cite{`. Two
+papers by the same author in the same year get `…attention` and `…attentionb`,
+the way BibTeX itself answers a collision. `--key` names one outright, and is
+told if the name was taken.
+
+Citing a document twice does nothing: a source records the `file_id` it came
+from, so the second `bib add` reports the key it already has.
+
+TeX's special characters are escaped on the way into the `.bib` and left alone
+in the record, so a title carrying `&`, `%`, or `_` is text in both. Titles are
+double-braced, because a BibTeX style will otherwise lowercase a title that was
+already capitalized the way its authors capitalized it.
 
 ## Reading the library from a program
 
@@ -517,6 +614,11 @@ sortyourpaperya note kahn                         # id or words: any command tak
 sortyourpaperya note <id>                         # open this document's notes ($EDITOR)
 sortyourpaperya note <id> reading-log             # ...a note by name; .md unless you say .json
 sortyourpaperya note <id> --path                  # ...or just say where they are
+sortyourpaperya bib init "PhD Thesis"             # start a bibliography under bibs/
+sortyourpaperya bib add --lib thesis --cite <id>  # cite a document in it
+sortyourpaperya bib add                           # ...or be asked which, and which
+sortyourpaperya bib build --lib thesis            # re-generate the .bib from bib.toml
+sortyourpaperya bib list                          # every bibliography in the library
 sortyourpaperya remove <id>                       # delete link, folder, and record (asks first)
 sortyourpaperya scan                              # refresh hashes of files edited in place
 sortyourpaperya fsck [--adopt]                    # check the store and database agree
