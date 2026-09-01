@@ -455,6 +455,12 @@ in the record, so a title carrying `&`, `%`, or `_` is text in both. Titles are
 double-braced, because a BibTeX style will otherwise lowercase a title that was
 already capitalized the way its authors capitalized it.
 
+A document with no author — a bill, a manual — draws
+`Warning--to sort, need author or key` from classic BibTeX under a style that
+sorts by author, and is sorted first. The entry is written and the run
+succeeds; it is what citing an authorless document costs, and `biblatex` does
+not mind at all.
+
 ## Reading the library from a program
 
 `sortyourpaperya find` searches everything a document is described by — its id, title,
