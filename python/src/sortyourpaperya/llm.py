@@ -580,6 +580,7 @@ class LazyOpenAiClient:
         self._max_retries = max_retries
         self._timeout_seconds = timeout_seconds
         self._client: OpenAiClient | None = None
+        self._generation: int | None = None
 
     @property
     def model(self) -> str:
@@ -591,9 +592,14 @@ class LazyOpenAiClient:
         Not cached across a failure: a key stored while the watcher runs is
         picked up by the next pass, without a restart.
         """
-        from .config import resolve_api_key
+        from .config import key_generation, resolve_api_key
 
+        if self._client is not None and self._generation != key_generation():
+            # A `sypy login` happened while this watcher was running. Rebuild
+            # rather than keep spending the key it replaced.
+            self._client = None
         if self._client is None:
+            self._generation = key_generation()
             self._client = OpenAiClient(
                 resolve_api_key(),
                 self._model,

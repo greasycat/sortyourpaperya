@@ -263,3 +263,44 @@ async def test_a_large_request_is_carried_rather_than_refused(library: Library) 
         assert answer["pid"] == os.getpid()
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_login_stores_through_the_watcher(library: Library, monkeypatch) -> None:
+    """The keyring is touched by one long-lived process, not by every command.
+
+    A desktop keyring confirms per process, so storing from the CLI is a dialog
+    each time -- which is the whole reason this op exists.
+    """
+    stored: dict = {}
+    monkeypatch.setattr(
+        "sortyourpaperya.config.store_api_key", lambda k: stored.update(key=k)
+    )
+    server = await _serving(library)
+    try:
+        assert await client.call_async(library.root, "login", {"key": "sk-x"}) == {
+            "stored": True
+        }
+        assert stored == {"key": "sk-x"}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_login_without_a_key_is_refused(library: Library) -> None:
+    server = await _serving(library)
+    try:
+        with pytest.raises(protocol.ProtocolError, match="no key given"):
+            await client.call_async(library.root, "login", {"key": "   "})
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_logout_forgets_through_the_watcher(library: Library, monkeypatch) -> None:
+    monkeypatch.setattr("sortyourpaperya.config.forget_api_key", lambda: True)
+    server = await _serving(library)
+    try:
+        assert await client.call_async(library.root, "logout") == {"removed": True}
+    finally:
+        await server.stop()

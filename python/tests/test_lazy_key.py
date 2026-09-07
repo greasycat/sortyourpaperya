@@ -76,3 +76,32 @@ class _Stub:
     async def describe_pages(self, *a, **k):
         return "ok"
 
+
+@pytest.mark.asyncio
+async def test_a_login_while_it_runs_replaces_the_live_key(monkeypatch) -> None:
+    """A watcher builds its client once and keeps it.
+
+    Without invalidation a `sypy login` would not take effect until someone
+    restarted the service -- and it would go on spending the key it replaced.
+    """
+    import sortyourpaperya.config as config
+    import sortyourpaperya.llm as llm
+
+    keys = iter(["sk-first", "sk-second"])
+    monkeypatch.setattr(config, "resolve_api_key", lambda: next(keys))
+    monkeypatch.setattr(llm, "OpenAiClient", lambda key, *a, **k: _Keyed(key))
+
+    client = LazyOpenAiClient("m")
+    assert await client.suggest_category(object()) == "sk-first"
+    assert await client.suggest_category(object()) == "sk-first"  # cached
+
+    config._key_changed()
+    assert await client.suggest_category(object()) == "sk-second"
+
+
+class _Keyed:
+    def __init__(self, key):
+        self.key = key
+
+    async def suggest_category(self, *a, **k):
+        return self.key

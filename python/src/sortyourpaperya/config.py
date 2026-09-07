@@ -148,6 +148,21 @@ def resolve_settings(
 KEYRING_SERVICE = "sortyourpaperya"
 KEYRING_USERNAME = "openai"
 
+# Bumped whenever the stored key changes. A long-running watcher builds its API
+# client once and keeps it; without this, a `login` while it runs would not take
+# effect until someone restarted the service.
+_KEY_GENERATION = 0
+
+
+def key_generation() -> int:
+    """A number that changes when the stored key does."""
+    return _KEY_GENERATION
+
+
+def _key_changed() -> None:
+    global _KEY_GENERATION
+    _KEY_GENERATION += 1
+
 
 # Whether this process may spend the key `login` stored. False everywhere until
 # the watcher says otherwise; see `becomes_the_spender`.
@@ -286,6 +301,7 @@ def store_api_key(key: str) -> None:
         keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, key)
     except Exception as exc:
         raise ConfigError(f"no keychain available to store the key: {exc}") from exc
+    _key_changed()
 
 
 def forget_api_key() -> bool:
@@ -321,6 +337,7 @@ def forget_api_key() -> bool:
             keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, "")
         except Exception as exc:
             raise ConfigError(f"could not clear the stored key: {exc}") from exc
+    _key_changed()
     return True
 
 

@@ -188,6 +188,35 @@ async def _ingest(library: Library, args: dict[str, Any], emit: Emit) -> Any:
     return protocol.dump(report)
 
 
+@op("login")
+async def _login(library: Library, args: dict[str, Any], emit: Emit) -> Any:
+    """Store the key, in the one process that is allowed to read it back.
+
+    Doing this here rather than in the command means the keyring is touched by a
+    single long-lived process instead of by every invocation -- a desktop
+    keyring confirms per process, so storing from the CLI is a dialog each time.
+    The watcher picks the new key up on its next request; nothing restarts.
+
+    The key crosses a socket that is `0600` in the user's own runtime directory,
+    to a process already entitled to read it. It is never logged.
+    """
+    from .config import store_api_key
+
+    key = (args.get("key") or "").strip()
+    if not key:
+        raise protocol.ProtocolError("no key given")
+    store_api_key(key)
+    return {"stored": True}
+
+
+@op("logout")
+async def _logout(library: Library, args: dict[str, Any], emit: Emit) -> Any:
+    """Forget the stored key, from the process that owns the keyring access."""
+    from .config import forget_api_key
+
+    return {"removed": forget_api_key()}
+
+
 @op("probe")
 async def _probe(library: Library, args: dict[str, Any], emit: Emit) -> Any:
     """Ask the API whether the watcher's key is accepted.

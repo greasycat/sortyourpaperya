@@ -1467,6 +1467,20 @@ def _service_file() -> Path | None:
     return None
 
 
+def _via_watcher_or_locally(op: str, args: dict, fallback):
+    """Ask the watcher to do it, or do it here when none is running.
+
+    The watcher is preferred for anything touching the keyring, so one process
+    holds that access rather than every command asking for it in turn.
+    """
+    from . import client
+
+    root = _resolved_library(None)
+    if root is not None and client.serving(root):
+        return client.call(root, op, args)
+    return fallback()
+
+
 def _serving_watcher() -> dict | None:
     """What the watcher for this library says about itself, if one is serving."""
     from . import client
@@ -1570,8 +1584,14 @@ def login(
     secret = (key or typer.prompt("API key", hide_input=True)).strip()
     if not secret:
         raise typer.BadParameter("no key given")
+    # Through the watcher when one is running: it is the process that reads the
+    # key back, and letting it also do the writing means the keyring is touched
+    # by one long-lived process instead of by every command. A desktop keyring
+    # confirms per process, so storing from here is a dialog each time.
     try:
-        store_api_key(secret)
+        _via_watcher_or_locally(
+            "login", {"key": secret}, lambda: store_api_key(secret)
+        )
     except ConfigError as err:
         typer.echo(f"error: {err}", err=True)
         raise typer.Exit(code=2) from err
@@ -1583,7 +1603,8 @@ def login(
 def logout() -> None:
     """Remove the stored API key from the system keychain."""
     try:
-        removed = forget_api_key()
+        result = _via_watcher_or_locally("logout", {}, forget_api_key)
+        removed = result["removed"] if isinstance(result, dict) else result
     except ConfigError as err:
         typer.echo(f"error: {err}", err=True)
         raise typer.Exit(code=2) from err
