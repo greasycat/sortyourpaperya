@@ -213,6 +213,10 @@ def _no_real_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
     Tests that exercise keychain behaviour install their own fake over this one.
     """
     monkeypatch.setitem(sys.modules, "keyring", _NoKeychain)
+    # And the Secret Service underneath it: the lookup falls back to searching
+    # collections directly when the default one has no entry, which would reach
+    # around the stub above and back into the developer's real keyring.
+    monkeypatch.setitem(sys.modules, "secretstorage", None)
     # The spender flag is a module global, so a test that sets it would leave
     # every later test in this process able to spend the stored key -- turning
     # the tests that check the opposite into ones that pass for the wrong

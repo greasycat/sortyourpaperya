@@ -229,9 +229,53 @@ def key_from_keychain() -> str | None:
     try:
         import keyring
 
-        return (keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or "").strip() or None
+        value = (keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or "").strip()
+        if value:
+            return value
     except Exception:
         return None
+    return _from_any_collection()
+
+
+def _from_any_collection() -> str | None:
+    """The key from a Secret Service collection other than the default one.
+
+    `keyring` searches only the collection aliased "default", so a key kept in
+    any other one -- an ordinary thing to do, and what a renamed or second
+    keyring leaves you with -- reads back as "no key found" while sitting there
+    perfectly intact.
+
+    **Locked collections are skipped, never unlocked.** Reading a locked item is
+    what raises a password prompt, and the process that needs this most is a
+    background service with nobody watching it: prompting there hangs the
+    watcher rather than failing it. A locked collection is treated as one that
+    does not have the key.
+
+    Returns None wherever Secret Service is not the backend -- macOS Keychain
+    has no collections to search, so `keyring` either found it or it is absent.
+    """
+    try:
+        import secretstorage
+    except Exception:
+        return None
+    if secretstorage is None:  # blocked, as the test suite does
+        return None
+    try:
+        connection = secretstorage.dbus_init()
+        for collection in secretstorage.get_all_collections(connection):
+            if collection.is_locked():
+                continue
+            for item in collection.search_items(
+                {"service": KEYRING_SERVICE, "username": KEYRING_USERNAME}
+            ):
+                if item.is_locked():
+                    continue
+                found = (item.get_secret() or b"").decode().strip()
+                if found:
+                    return found
+    except Exception:
+        return None
+    return None
 
 
 def store_api_key(key: str) -> None:

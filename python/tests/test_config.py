@@ -232,3 +232,99 @@ def test_a_client_never_reads_the_keychain_at_all(monkeypatch) -> None:
     with pytest.raises(ConfigError):
         resolve_api_key()
     assert touched == []
+
+
+# ---- finding a key kept outside the default collection ---------------------
+
+
+def _fake_secretstorage(monkeypatch, collections):
+    """A Secret Service with the given collections, for the fallback lookup."""
+    import types
+
+    class Item:
+        def __init__(self, attrs, secret, locked=False):
+            self._a, self._s, self._locked = attrs, secret, locked
+            self.read = False
+
+        def is_locked(self):
+            return self._locked
+
+        def get_secret(self):
+            self.read = True
+            return self._s.encode()
+
+    class Collection:
+        def __init__(self, label, items, locked=False):
+            self._label, self._items, self._locked = label, items, locked
+
+        def get_label(self):
+            return self._label
+
+        def is_locked(self):
+            return self._locked
+
+        def search_items(self, attrs):
+            return [i for i in self._items if i._a == attrs]
+
+    module = types.SimpleNamespace(
+        dbus_init=lambda: object(),
+        get_all_collections=lambda _c: collections,
+    )
+    monkeypatch.setitem(__import__("sys").modules, "secretstorage", module)
+    return Collection, Item
+
+
+def test_a_key_in_a_non_default_collection_is_found(monkeypatch) -> None:
+    """`keyring` searches only the collection aliased "default".
+
+    A key kept in any other one — what a renamed or second keyring leaves you
+    with — read back as "no key found" while sitting there intact.
+    """
+
+    class NoDefaultEntry:
+        @staticmethod
+        def get_password(service, username):
+            return None
+
+    monkeypatch.setitem(__import__("sys").modules, "keyring", NoDefaultEntry)
+    Collection, Item = _fake_secretstorage(monkeypatch, [])
+    item = Item({"service": "sortyourpaperya", "username": "openai"}, "sk-elsewhere")
+    _fake_secretstorage(monkeypatch, [Collection("other", [item])])
+
+    assert config.key_from_keychain() == "sk-elsewhere"
+
+
+def test_a_locked_collection_is_skipped_rather_than_unlocked(monkeypatch) -> None:
+    """Reading a locked item is what raises a password prompt.
+
+    The process that needs this most is a background service with nobody
+    watching it, where a prompt hangs the watcher instead of failing it.
+    """
+
+    class NoDefaultEntry:
+        @staticmethod
+        def get_password(service, username):
+            return None
+
+    monkeypatch.setitem(__import__("sys").modules, "keyring", NoDefaultEntry)
+    Collection, Item = _fake_secretstorage(monkeypatch, [])
+    item = Item({"service": "sortyourpaperya", "username": "openai"}, "sk-locked")
+    _fake_secretstorage(monkeypatch, [Collection("locked one", [item], locked=True)])
+
+    assert config.key_from_keychain() is None
+    assert item.read is False  # never touched, so never prompted
+
+
+def test_the_default_collection_still_wins(monkeypatch) -> None:
+    class HasIt:
+        @staticmethod
+        def get_password(service, username):
+            return "sk-from-default"
+
+    monkeypatch.setitem(__import__("sys").modules, "keyring", HasIt)
+    Collection, Item = _fake_secretstorage(monkeypatch, [])
+    other = Item({"service": "sortyourpaperya", "username": "openai"}, "sk-elsewhere")
+    _fake_secretstorage(monkeypatch, [Collection("other", [other])])
+
+    assert config.key_from_keychain() == "sk-from-default"
+    assert other.read is False  # no need to look further
