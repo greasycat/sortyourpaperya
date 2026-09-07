@@ -1074,6 +1074,13 @@ def test_bib_add_asks_before_it_opens_the_database(library, monkeypatch) -> None
     monkeypatch.setattr(
         cli, "Library", lambda *a, **k: order.append("opened") or open_library(*a, **k)
     )
+    # The command reaches the library through the read seam now, which takes a
+    # read-only connection and so holds no write lock at all -- a stronger form
+    # of the same contract. Record that too, or the order comes back empty.
+    seam = cli._reading
+    monkeypatch.setattr(
+        cli, "_reading", lambda *a, **k: order.append("opened") or seam(*a, **k)
+    )
 
     result = _invoke(root, "bib", "add", input=f"thesis\n{paper.file_id}\n")
 

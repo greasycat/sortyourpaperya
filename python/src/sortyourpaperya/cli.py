@@ -17,6 +17,7 @@ from . import notes
 from .bib import BibError, Bibliography
 from .budget import Budget
 from .config import (
+    becomes_the_spender,
     KEYRING_SERVICE,
     forget_api_key,
     key_from_keychain,
@@ -36,6 +37,7 @@ from .db import SORTS, Paper
 from .extract import ExtractionError
 from .ingest import ingest_folder
 import os
+import contextlib
 import shutil
 import subprocess
 
@@ -138,32 +140,85 @@ def ingest(
     folder it happens to sit in coming along with it.
     """
     _check_input(input_dir)
+    # The watcher owns the stored key and the write connection, so when one is
+    # running the filing is its job. That is also what makes `sypy login` mean
+    # what it says: the key it stores is spent here, by the service, whoever
+    # typed the command.
+    from . import client as _client
+
+    root = _resolved_library(library_dir)
+    if root is not None and _client.serving(root):
+        report = _ingest_via_watcher(_client, root, input_dir, mode, model)
+        _report_ingest(report, mode)
+        return
+
     settings, client = _build(
         input_dir, library_dir, recursive, page_cutoff, batch_size, model
     )
     with Library(settings.output_dir) as library:
         report = asyncio.run(ingest_folder(settings, client, library, mode=mode))
-
-        verb = "filed" if mode.writes else "would file"
-        typer.echo(
-            f"{verb} {report.processed} document(s); "
-            f"{report.skipped_already_known} already known; "
-            f"{len(report.skipped_oversized)} oversized; {len(report.failed)} failed"
-        )
-        if report.rescan and report.rescan.changed:
-            typer.echo(
-                f"  ({len(report.rescan.changed)} stored file(s) changed on disk; "
-                "hashes refreshed)"
-            )
-        for filing in report.filed or report.planned:
-            typer.echo(f"  {filing.describe()}")
-        for path, reason in report.failed:
-            typer.echo(f"  ! {path.name}: {reason}", err=True)
-        if not mode.writes and report.planned:
-            typer.echo("\nnothing was written; re-run with --mode copy or --mode move")
+        _report_ingest(report, mode)
 
     if report.failed:
         raise typer.Exit(code=1)
+
+
+def _ingest_via_watcher(client_mod, root: Path, input_dir: Path | None, mode, model):
+    """Have the watcher file the folder, printing what it files as it goes.
+
+    The pass runs there, so its per-document lines arrive as events rather than
+    all at once when it finishes -- a folder of fifty takes a while, and silence
+    for the whole of it reads as a hang.
+    """
+    if input_dir is None:
+        # Without one, `ingest` files the current directory. That was a local
+        # mistake when the key had to be in this shell; handing an unnamed
+        # directory to the watcher makes it a spend on the service's key from
+        # wherever the command happened to be typed. Say what to file.
+        raise typer.BadParameter(
+            "name what to file with --input when a watcher is running; "
+            "it is the watcher that spends, so the folder is not assumed"
+        )
+    _check_input(input_dir)
+    from . import protocol
+
+    # Decoded like every other result that crosses the socket. Without this the
+    # report arrives as the dict `protocol.dump` made of it, and the reporting
+    # below dies on `.processed` -- after the pass has already run and been paid
+    # for, which is the worst possible moment to fall over.
+    return protocol.load(client_mod.call(
+        root,
+        "ingest",
+        {
+            "input_dir": str(input_dir),
+            "mode": mode.value,
+            "model": model,
+        },
+        on_event=lambda frame: typer.echo(
+            f"  {frame.get('event')}: {frame.get('input', '')}".rstrip(": ")
+        ),
+    ))
+
+
+def _report_ingest(report, mode) -> None:
+    """What a pass did, for a person reading it."""
+    verb = "filed" if mode.writes else "would file"
+    typer.echo(
+        f"{verb} {report.processed} document(s); "
+        f"{report.skipped_already_known} already known; "
+        f"{len(report.skipped_oversized)} oversized; {len(report.failed)} failed"
+    )
+    if report.rescan and report.rescan.changed:
+        typer.echo(
+            f"  ({len(report.rescan.changed)} stored file(s) changed on disk; "
+            "hashes refreshed)"
+        )
+    for filing in report.filed or report.planned:
+        typer.echo(f"  {filing.describe()}")
+    for path, reason in report.failed:
+        typer.echo(f"  ! {path.name}: {reason}", err=True)
+    if not mode.writes and report.planned:
+        typer.echo("\nnothing was written; re-run with --mode copy or --mode move")
 
 
 def _check_input(path: Path | None) -> None:
@@ -221,6 +276,11 @@ def watch(
         typer.echo(f"error: no watch named {name!r}", err=True)
         raise typer.Exit(code=2)
 
+    # This process is the service, so it is the one `sypy login` stored a key
+    # for -- declared before the client is built, which is where the key is
+    # resolved. A command run by hand never reaches this line, which is the
+    # whole point: the stored key is the watcher's to spend.
+    becomes_the_spender()
     settings, client = _build(
         input_dir, library_dir, recursive, page_cutoff, batch_size, model
     )
@@ -245,7 +305,7 @@ def tree(
 ) -> None:
     """Rebuild the symlink tree from the database."""
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         linked = library.rebuild_tree()
         typer.echo(f"linked {linked} document(s) under {library.tree_dir}")
         for paper in library.missing_files():
@@ -397,7 +457,7 @@ def retag(
         typer.echo(f"error: {category!r} has no usable tags", err=True)
         raise typer.Exit(code=2)
 
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         _apply_retag(library, _resolve(library, file_id).file_id, tags)
 
 
@@ -424,7 +484,7 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
     """
     settings, client = _build(None, library_dir, None, None, None, model)
 
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         paper = _resolve(library, file_id)
         store_path = library.store_path(paper)
         steering = library.existing_categories(MAX_STEERING_CATEGORIES)
@@ -479,7 +539,7 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
 
             choice, direction = _ask_what_to_do()
             if choice == "accept":
-                with Library(settings.output_dir) as writable:
+                with _writing(settings.output_dir) as writable:
                     _apply_retag(
                         writable, paper.file_id, tags, suggestion.keywords or None
                     )
@@ -566,7 +626,7 @@ def read_document(
     """
     first, last = _pages(pages)
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         paper = _resolve(library, file_id)
         path = library.store_path(paper)
         if not path.is_file():
@@ -675,7 +735,7 @@ def note(
     drive would be left holding a terminal open forever.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         paper = _resolve(library, file_id)
         if not library.document_dir(paper).is_dir():
             typer.echo(f"error: {paper.store_name} is missing from the store", err=True)
@@ -829,7 +889,7 @@ def bib_add(
     bibliography = _pick_bib(settings.output_dir, lib)
     needle = cite or _prompt("which document? (id, or words from it)")
 
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         paper = _resolve(library, needle)
 
         already = bibliography.source_for(paper.file_id)
@@ -981,7 +1041,7 @@ def _cited_source(bibliography: Bibliography, library_root: Path, needle: str):
     if exact is not None:
         return exact
 
-    with Library(library_root) as library:
+    with _reading(library_root) as library:
         paper = _resolve(library, needle)
     source = bibliography.source_for(paper.file_id)
     if source is None:
@@ -1058,7 +1118,7 @@ def migrate_store(
 ) -> None:
     """Bring the store's layout and filenames in line with the current rules."""
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         moved = library.migrate_store_layout()
         for file_id in moved:
             paper = library.db.get(file_id)
@@ -1092,7 +1152,7 @@ def fsck(
     else can find.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         missing = library.missing_files()
         orphans = library.orphans()
 
@@ -1136,7 +1196,7 @@ def scan(
 ) -> None:
     """Re-check stored files and refresh the hashes of any edited in place."""
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         report = library.rescan()
         typer.echo(
             f"checked {report.checked} document(s); "
@@ -1166,7 +1226,7 @@ def remove(
     changes as the library grows, and an unattended delete must not.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         if yes and library.db.get(file_id) is None:
             typer.echo(
                 f"error: --yes needs an exact id, and {file_id!r} is not one.",
@@ -1214,7 +1274,7 @@ def cited(
     hand is answered correctly the moment it is saved, with nothing to rebuild.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         paper = _resolve(library, file_id)
     found = bibs.citations_of(settings.output_dir, paper.file_id)
 
@@ -1247,7 +1307,7 @@ def backup(
     tree` rebuilds it. Run it from cron or a launchd agent for a nightly copy.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         try:
             report = library.backup(destination)
         except LibraryError as err:
@@ -1278,7 +1338,7 @@ def cache(
     next pass asks the model again.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         if forget:
             typer.echo(f"forgot {library.db.forget_model_answers()} banked answer(s)")
             return
@@ -1397,17 +1457,53 @@ def _service_file() -> Path | None:
     return None
 
 
+def _serving_watcher() -> dict | None:
+    """What the watcher for this library says about itself, if one is serving."""
+    from . import client
+
+    try:
+        root = _resolved_library(None)
+        if root is None or not client.serving(root):
+            return None
+        return client.call(root, "ping")
+    except Exception:
+        return None
+
+
 def _doctor_model(ok, bad, warn, *, offline: bool) -> None:
     """The key, the model, and what the day's spend has left."""
+    # The watcher is what spends, so it is what gets asked. Reading the keychain
+    # from here would prompt for a password and still answer the wrong question.
+    watcher = _serving_watcher()
     key = None
-    try:
-        key = resolve_api_key()
-    except ConfigError as err:
-        bad(str(err), "run `sypy login`")
+    if watcher is not None:
+        if watcher.get("has_key"):
+            if offline:
+                ok("the watcher has a key")
+            else:
+                # "Has a key" is not "has a key that works", and only the
+                # watcher can find out which -- the key is its to read.
+                from . import client as _client
 
-    if key:
-        source = "keychain" if key_from_keychain() == key else "the environment"
-        ok(f"key found in {source} (…{key[-4:]})")
+                verdict = _client.call(_resolved_library(None), "probe")
+                if verdict.get("ok"):
+                    ok("the API accepts the watcher's key")
+                else:
+                    bad(
+                        f"the API refused the watcher's key: {verdict.get('detail')}",
+                        "run `sypy login` with a working key, then restart the watcher",
+                    )
+        else:
+            bad("the watcher has no API key", "run `sypy login`, then restart the watcher")
+    else:
+        try:
+            key = resolve_api_key()
+            ok(f"key set for commands run by hand (…{key[-4:]})")
+        except ConfigError:
+            warn(
+                "no watcher running, and no key set for this shell -- "
+                "`sypy login` stores one for the watcher; OPENAI_API_KEY covers a single run"
+            )
 
     model = resolve_settings(None, None).model
     ok(f"model {model}")
@@ -1492,16 +1588,24 @@ def logout() -> None:
 
 @app.command("whoami", hidden=True)
 def whoami() -> None:
-    """Where the key is coming from, without printing it."""
-    stored = key_from_keychain()
-    if stored:
-        typer.echo(f"keychain (…{stored[-4:]})")
+    """Where the key is coming from, without printing it.
+
+    The stored key is not read here. This is a client, and reading the keychain
+    from one is what puts a password dialog in front of whoever is sitting
+    there -- the thing the spender rule exists to avoid. The watcher is asked
+    instead, since it is the process that would spend it.
+    """
+    watcher = _serving_watcher()
+    if watcher is not None:
+        typer.echo(
+            "the watcher has a key" if watcher.get("has_key") else "the watcher has no key"
+        )
         return
     for name in ("OPENAI_API_KEY", "SYP_API_KEY", "OEPNAI_API_KEY"):
         if (value := (os.environ.get(name) or "").strip()):
             typer.echo(f"{name} (…{value[-4:]})")
             return
-    typer.echo("no key; run `sypy login`")
+    typer.echo("no key set for this shell; `sypy login` stores one for the watcher")
 
 
 @app.command()
@@ -1613,7 +1717,7 @@ def list_papers(
     """List what the library holds."""
     settings = _settings(None, library_dir)
     _check_sort(sort)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         _report(library, library.db.all_papers(sort=sort), as_json=as_json)
 
 
@@ -1648,7 +1752,7 @@ def find(
     """
     settings = _settings(None, library_dir)
     _check_sort(sort)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         # One more than will be shown, which is how the cap is noticed. A
         # capped result that says nothing about it reads as the whole answer,
         # and the reader stops looking for the document that was cut off.
@@ -1679,7 +1783,7 @@ def categories(
     question the database can group.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         counted = library.db.category_counts()
     if as_json:
         typer.echo(
@@ -1717,7 +1821,7 @@ def attr(
     replaces what was there.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         paper = _resolve(library, file_id)
 
         if unset:
@@ -1776,7 +1880,7 @@ def sql(
     DuckDB allows one process, and it refuses a second connection even to read.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         try:
             # One more than will be shown, which is how the cap is noticed.
             columns, rows = library.db.select(
@@ -1811,6 +1915,45 @@ def sql(
             "or pass --limit 0 for all of them",
             err=True,
         )
+
+
+@contextlib.contextmanager
+def _writing(root: Path):
+    """A library to change, whoever is holding it.
+
+    The watcher owns the write connection while it runs, so a command that would
+    otherwise wait out a pass -- or fail after 30s -- asks it to do the write
+    instead. With no watcher, this is exactly what it always was.
+    """
+    from . import client
+
+    with client.writing(root) as library:
+        if library is not None:
+            yield library
+            return
+    with Library(root) as library:
+        yield library
+
+
+@contextlib.contextmanager
+def _reading(root: Path):
+    """A library to read from, whoever else is using it.
+
+    Read-only connections coexist, so this works with no watcher running -- the
+    library stays readable when nothing is serving it. When a pass does hold the
+    lock, the watcher answers instead of the file; and when there is no watcher
+    to ask, this waits the way it always has.
+    """
+    from . import client
+
+    with client.reading(root) as library:
+        if library is not None:
+            yield library
+            return
+    # Locked, and nobody to ask. Wait it out, as every command did before there
+    # was a watcher to ask at all.
+    with Library(root) as library:
+        yield library
 
 
 def _report(library: Library, papers: Sequence[Paper], *, as_json: bool) -> None:
@@ -1912,8 +2055,13 @@ def _resolved_library(library_dir: Path | None, watch_name: str | None = None) -
     CLI beats the environment beats the registry, which is the order the rest of
     the settings already resolve in.
     """
-    if library_dir is not None or os.environ.get("SYP_OUTPUT"):
+    if library_dir is not None:
         return library_dir
+    if (from_env := os.environ.get("SYP_OUTPUT")):
+        # Named, just not on the command line. Returning None here left callers
+        # that ask "is a watcher serving this library?" unable to answer, so a
+        # command with SYP_OUTPUT set never found the watcher that was serving it.
+        return Path(from_env).expanduser()
     try:
         entry = _watch_entry(watch_name)
     except typer.Exit:

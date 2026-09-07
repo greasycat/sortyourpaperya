@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -176,6 +177,54 @@ def _isolated_watch_locks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("SORTYOURPAPERYA_STATE_DIR", str(tmp_path / "state"))
     # And the registry, so a real one on this machine cannot steer a test.
     monkeypatch.setenv("SORTYOURPAPERYA_CONFIG_DIR", str(tmp_path / "config"))
+
+
+class _NoKeychain:
+    """A keychain that is not there, which is what a test machine should look like."""
+
+    _WHY = "the keychain is not available to the test suite"
+
+    @staticmethod
+    def get_password(service: str, username: str) -> None:
+        raise RuntimeError(_NoKeychain._WHY)
+
+    @staticmethod
+    def set_password(service: str, username: str, value: str) -> None:
+        raise RuntimeError(_NoKeychain._WHY)
+
+    @staticmethod
+    def delete_password(service: str, username: str) -> None:
+        raise RuntimeError(_NoKeychain._WHY)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's own keychain out of the suite, for the same reason.
+
+    `resolve_api_key` consults the keychain before the environment, so without
+    this every test that needs a key reaches into the real one -- and a desktop
+    keyring asks the person sitting there to confirm each new process. `pytest`
+    is a new process every run, so that is a dialog per run, forever.
+
+    It also stops a developer who happens to be logged in from getting a
+    different result than CI, which is the kind of difference nobody debugs
+    until it has wasted an afternoon.
+
+    Tests that exercise keychain behaviour install their own fake over this one.
+    """
+    monkeypatch.setitem(sys.modules, "keyring", _NoKeychain)
+    # The spender flag is a module global, so a test that sets it would leave
+    # every later test in this process able to spend the stored key -- turning
+    # the tests that check the opposite into ones that pass for the wrong
+    # reason, depending on order.
+    from sortyourpaperya import config as _config
+
+    monkeypatch.setattr(_config, "_MAY_USE_KEYCHAIN", False)
+    # With no keychain and no .env, commands that resolve a key would exit 2
+    # before reaching what they are being tested for. They all inject a fake
+    # model client, so the key only has to exist -- it is never spent, and a
+    # value this obviously fake fails loudly if anything ever does send it.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-not-a-real-key-for-tests")
 
 
 @pytest.fixture

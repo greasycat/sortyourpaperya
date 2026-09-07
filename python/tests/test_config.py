@@ -43,6 +43,12 @@ def no_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "key_from_keychain", lambda: None)
 
 
+@pytest.fixture
+def spender(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This process is the watcher, so it may spend the stored key."""
+    monkeypatch.setattr(config, "_MAY_USE_KEYCHAIN", True)
+
+
 @pytest.fixture(autouse=True)
 def _no_ambient_key(monkeypatch: pytest.MonkeyPatch) -> None:
     # The developer's own .env and exported key must not decide these.
@@ -51,13 +57,15 @@ def _no_ambient_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda *a, **k: False)
 
 
-def test_login_stores_the_key_and_it_is_what_gets_used(keychain: dict) -> None:
+def test_login_stores_the_key_and_the_watcher_uses_it(
+    keychain: dict, spender: None
+) -> None:
     config.store_api_key("sk-from-login")
     assert resolve_api_key() == "sk-from-login"
 
 
 def test_the_keychain_wins_over_a_stale_export(
-    keychain: dict, monkeypatch: pytest.MonkeyPatch
+    keychain: dict, spender: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Otherwise `login` would appear to do nothing on a machine whose .zshrc
     # still exports last year's key.
@@ -82,7 +90,9 @@ def test_logout_falls_back_to_the_environment(
     assert resolve_api_key() == "sk-env"
 
 
-def test_surrounding_whitespace_is_not_part_of_the_key(keychain: dict) -> None:
+def test_surrounding_whitespace_is_not_part_of_the_key(
+    keychain: dict, spender: None
+) -> None:
     # A key pasted from a browser arrives with a newline more often than not.
     config.store_api_key("sk-pasted\n")
     assert resolve_api_key() == "sk-pasted"
@@ -161,3 +171,64 @@ def test_storing_without_a_keychain_says_so_rather_than_pretending(
 def test_no_key_anywhere_names_the_login_command(no_keychain: None) -> None:
     with pytest.raises(ConfigError, match="sypy login"):
         resolve_api_key()
+
+
+# ---- who may spend the stored key ------------------------------------------
+
+
+def test_a_command_run_by_hand_does_not_spend_the_watchers_key(
+    keychain: dict,
+) -> None:
+    """The requirement this whole arrangement exists for.
+
+    `sypy login` stores a key so the *background service* has one -- a process
+    started by launchd or systemd cannot be handed a key any other way. It does
+    not follow that an `ingest` typed at a prompt should quietly spend it, and
+    the surprise is expensive: it looks free until the bill.
+    """
+    config.store_api_key("sk-the-watchers-key")
+    with pytest.raises(ConfigError, match="which is what spends it"):
+        resolve_api_key()
+
+
+def test_the_refusal_says_what_to_do_instead(keychain: dict) -> None:
+    config.store_api_key("sk-the-watchers-key")
+    with pytest.raises(ConfigError, match="sypy watch"):
+        resolve_api_key()
+
+
+def test_a_key_chosen_for_this_run_is_still_honoured(
+    keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Setting OPENAI_API_KEY for one command is a deliberate act with a key the
+    # person picked for it, which is the opposite of quietly drawing on the
+    # service's credential. It must keep working.
+    config.store_api_key("sk-the-watchers-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-mine-for-this-run")
+    assert resolve_api_key() == "sk-mine-for-this-run"
+
+
+def test_the_watcher_spends_the_stored_key(keychain: dict, spender: None) -> None:
+    config.store_api_key("sk-the-watchers-key")
+    assert resolve_api_key() == "sk-the-watchers-key"
+
+
+def test_a_client_never_reads_the_keychain_at_all(monkeypatch) -> None:
+    """Not even to write a better error message.
+
+    Reading it is what makes a locked keyring put a password dialog in front of
+    whoever is sitting there, and a command that may not spend the stored key
+    has no business waking that.
+    """
+    touched = []
+
+    class Loud:
+        @staticmethod
+        def get_password(service, username):
+            touched.append((service, username))
+            return "sk-should-not-be-read"
+
+    monkeypatch.setitem(__import__("sys").modules, "keyring", Loud)
+    with pytest.raises(ConfigError):
+        resolve_api_key()
+    assert touched == []

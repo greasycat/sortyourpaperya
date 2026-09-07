@@ -60,6 +60,26 @@ def state_dir() -> Path:
     return Path(base) / "sortyourpaperya"
 
 
+def runtime_dir() -> Path:
+    """Where this machine keeps sockets, as opposed to state it keeps between runs.
+
+    A Unix socket path is capped near 104 bytes -- the whole path, not the name --
+    and `state_dir()` is nested under a home directory that can be arbitrarily
+    deep. XDG puts sockets in the runtime directory for exactly this reason, and
+    it is short by construction (`/run/user/1000`). macOS has no such variable, so
+    `TMPDIR` stands in; it is also short, and a socket is worthless after a reboot
+    anyway.
+
+    `SORTYOURPAPERYA_RUNTIME_DIR` overrides it, which is how the tests keep out of
+    the real user directories without reintroducing the length problem.
+    """
+    override = os.environ.get("SORTYOURPAPERYA_RUNTIME_DIR")
+    if override:
+        return Path(override) / "sortyourpaperya"
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    return Path(base) / "sortyourpaperya"
+
+
 class ConfigError(RuntimeError):
     """Raised when the resolved configuration cannot be used."""
 
@@ -129,10 +149,38 @@ KEYRING_SERVICE = "sortyourpaperya"
 KEYRING_USERNAME = "openai"
 
 
-def resolve_api_key() -> str:
-    """The OpenAI key: from the keychain if `login` put one there, else the environment.
+# Whether this process may spend the key `login` stored. False everywhere until
+# the watcher says otherwise; see `becomes_the_spender`.
+_MAY_USE_KEYCHAIN = False
 
-    The keychain comes first because it is the one place the key is neither in
+
+def becomes_the_spender() -> None:
+    """Declare this process the one allowed to use the stored key.
+
+    Called by the watcher, and only by it. `sypy login` puts a key in the
+    keychain so the *service* has one -- a background process cannot be handed a
+    key any other way, since neither launchd nor systemd inherits a shell. It
+    does not follow that every command run by hand should quietly spend it, and
+    the surprise there is expensive: an `ingest` typed at a prompt drawing on the
+    service's credential looks free until the bill.
+
+    The environment is untouched by this. `OPENAI_API_KEY=... sypy ingest` is a
+    deliberate act with a key the person chose for that run, which is the
+    opposite of the case above.
+    """
+    global _MAY_USE_KEYCHAIN
+    _MAY_USE_KEYCHAIN = True
+
+
+def resolve_api_key() -> str:
+    """The OpenAI key: the environment, plus the keychain in the watcher only.
+
+    The keychain is read only by the process that called `becomes_the_spender`,
+    which is the watcher. Everywhere else this is the environment and `.env`
+    alone -- see that function for why, and note it is consulted *first* in the
+    watcher, so `login` is not shadowed by a stale export.
+
+    The keychain matters because it is the one place the key is neither in
     a file next to the code nor in a shell profile that no supervisor inherits.
     `sypy login` puts it there; macOS Keychain and the Linux Secret
     Service both unlock at login, so the watcher has it after a reboot without
@@ -144,16 +192,28 @@ def resolve_api_key() -> str:
     ``OEPNAI_API_KEY`` is accepted because the repository's own ``.env`` spells
     it that way; the correct spelling wins when both are set.
     """
-    stored = key_from_keychain()
-    if stored:
-        return stored
+    if _MAY_USE_KEYCHAIN:
+        stored = key_from_keychain()
+        if stored:
+            return stored
     load_dotenv(_repo_dotenv(), override=False)
     for name in ("OPENAI_API_KEY", "SYP_API_KEY", "OEPNAI_API_KEY"):
         value = (os.getenv(name) or "").strip()
         if value:
             return value
+    if not _MAY_USE_KEYCHAIN:
+        # Deliberately without asking the keychain whether it holds one. Reading
+        # it is what makes a locked keyring prompt, and a command that cannot
+        # use the stored key has no business waking that dialog to write a
+        # better error message. A process that may not spend the stored key
+        # never touches it at all.
+        raise ConfigError(
+            "no API key for this command. `sypy login` stores a key for the "
+            "watcher, which is what spends it -- start the watcher and let it do "
+            "the work (`sypy watch`), or set OPENAI_API_KEY for this run."
+        )
     raise ConfigError(
-        "no API key found; run `sypy login`, "
+        "no API key found; run `sypy login` so the watcher has one, "
         "or set OPENAI_API_KEY in the environment or in .env"
     )
 
@@ -200,10 +260,15 @@ def forget_api_key() -> bool:
         raise ConfigError(f"no keychain available: {exc}") from exc
 
     try:
-        if not (keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or "").strip():
-            return False
-    except Exception as exc:
-        raise ConfigError(f"cannot read the keychain: {exc}") from exc
+        had_one = bool((keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or "").strip())
+    except Exception:
+        # A backend that refuses the read may still accept the delete, and
+        # logging out has to work regardless of which half is unavailable.
+        # Whether there was a key becomes unknown, not a reason to stop.
+        had_one = True
+
+    if not had_one:
+        return False
 
     try:
         keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)

@@ -975,7 +975,8 @@ spend ledger — is `SORTYOURPAPERYA_STATE_DIR`, defaulting to `~/.local/state/s
 registry is `SORTYOURPAPERYA_CONFIG_DIR`, and `SORTYOURPAPERYA_LOG_FILE` turns on the rotating log
 (the service sets it; a second process rotating the same file can lose lines).
 
-The API key comes from the keychain first, then from `OPENAI_API_KEY`,
+Inside the watcher the API key comes from the keychain first, then from
+`OPENAI_API_KEY`,
 `SYP_API_KEY`, or `OEPNAI_API_KEY`,
 including from the repository-root `.env`. The third spelling is a typo this
 repo's `.env` currently carries; it is accepted so the tool works as-is,
@@ -997,13 +998,50 @@ fail and nothing else does), that each declared watch has a folder to watch and
 a library to write to, and whether anything is actually running — separating
 *stopped* from *a service is installed and yet nothing is running*, which is
 the case worth catching: the folder looks watched and nothing has been filed
-for a week. Then the key, the model, whether the API accepts the key, and what
-the day's spend has left.
+for a week. Then the model, and what the day's spend has left.
+
+The key it asks the **watcher** about, because the watcher is what spends it and
+the only process that can see it — including whether the API actually accepts
+it, which the watcher checks on request, so an expired key is still caught. A watcher running without a key is a failure
+worth shouting about — it will die on the first document it is handed. No watcher
+running is only a warning: the stored key is not readable from here by design, so
+"I cannot see one" says nothing about whether the service has one.
 
 The API check lists models rather than labelling anything. That call is free,
 so `doctor` never costs money; `--offline` skips it anyway. Checking only that
 a key *exists* is the check that lulls you — an expired key looks exactly like
 a working one until the first document.
+
+## The watcher, and what talks to it
+
+While `sypy watch` runs it serves a Unix socket for its library, and the other
+commands use it. It is not a separate process to start: the watcher already
+holds the write connection, and `watchlock` already guarantees one per library,
+which is what makes "the watcher for this library" a well-defined thing to
+address rather than a race.
+
+Three routes, by what a command needs:
+
+| | with a watcher running | with none |
+|---|---|---|
+| **read** — `find` `list` `categories` `sql` `cited` `read` | direct, read-only; the watcher answers only while a pass holds the lock | direct |
+| **change** — `attr` `remove` `retag` `fsck` `scan` `tree` `migrate-store` `cache` `backup` | the watcher makes the change | in-process, waiting for the lock as before |
+| **spend** — `ingest` | the watcher files it, with its key | refused unless `OPENAI_API_KEY` is set for the run |
+
+**Reads deliberately do not go through the watcher.** Several read-only
+connections coexist, so a question about the library is answered whether or not
+anything is serving — an agent asking what you have filed never depends on a
+background process being up. The one case that excludes readers is a pass
+holding the write lock, and that is exactly when the watcher can answer, so the
+fallback costs a round trip instead of a thirty-second wait.
+
+Nothing starts a watcher on your behalf. A read command that silently launched a
+background process which spends money is the opposite of the point.
+
+The socket lives in the runtime directory (`XDG_RUNTIME_DIR`, or `TMPDIR` on
+macOS), one per library, mode `0600`. Not under the home directory with the rest
+of the state: a socket path is capped near 104 bytes, and a library a few folders
+deep would fail at `bind` with nothing but "path too long" to go on.
 
 ## The API key
 
@@ -1017,8 +1055,29 @@ unlock when you log in, so the watcher has the key after a reboot without
 anything being typed — which a key exported in `.zshrc` does not, because
 neither launchd nor systemd inherits the shell that installed the service.
 
-The keychain wins over the environment. Otherwise `login` would appear to do
-nothing on a machine whose shell profile still exports last year's key.
+**The stored key is the watcher's.** That is what `login` is for: a background
+process cannot be handed a key any other way. It does not follow that every
+command run by hand should quietly spend it, and the surprise there is
+expensive — an `ingest` typed at a prompt looks free until the bill.
+
+So **only `login`, `logout`, and the watcher ever read the keychain.** No other
+command touches it, not even to write a better error message: reading it is what
+makes a locked keyring put a password dialog in front of whoever is sitting
+there. `whoami` and `doctor` ask the watcher instead, since it is the process
+that would spend.
+
+Be exact about the guarantee. A hand-typed `sypy ingest` still causes spending
+when a watcher is running — the watcher does the filing, on its key, and prints
+what it filed. What cannot happen is a command quietly reading the stored key and
+spending it *itself*, unattributed. When routing like that, `--input` is
+required: `ingest` otherwise files the current directory, which is a local
+mistake when the key is in your shell and a spend on the service's key when it
+is not.
+
+`OPENAI_API_KEY` still works everywhere, and is unaffected by any of this. Setting
+it for one command is a deliberate act with a key you chose for that run, which is
+the opposite case. For the watcher the keychain wins over the environment, so
+`login` is not shadowed by a profile still exporting last year's key.
 
 `--key` takes the value directly, for a script. Without it the prompt is
 hidden, so the key is not left in shell history.

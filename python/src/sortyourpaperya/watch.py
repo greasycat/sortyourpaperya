@@ -15,6 +15,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .config import Settings
+from .daemon import Server
 from .discovery import Snapshot, snapshot_input
 from .ingest import IngestReport, ingest_folder
 from .library import FilingMode, Library, PlannedFiling
@@ -78,6 +79,12 @@ async def watch(
     # either writes.
     claim = claim_folders(settings.input_dir, library.root)
 
+    # Served only once the claim is held: the socket says "the watcher for this
+    # library is here", and two of them saying it would make that a lie. Taking
+    # over a path an earlier watcher left behind is safe for the same reason.
+    server = Server(library)
+    await server.start()
+
     wake = asyncio.Event()
     observer = _start_observer(settings, wake)
     log.info(
@@ -112,7 +119,12 @@ async def watch(
             last_run = pending
 
             try:
-                report = await ingest_folder(settings, client, library, mode=mode)
+                # The same lock a client op takes. Without it the watcher's own pass
+                # and a routed `sypy ingest` overlap: both decide what is new before
+                # either writes, so both file the same PDF and the store is left with
+                # an orphan folder for a row that exists once.
+                async with server.busy:
+                    report = await ingest_folder(settings, client, library, mode=mode)
             except Exception as err:  # a bad pass must not kill the watcher
                 log.error("ingest failed: %s; waiting for the next change", err)
                 continue
@@ -166,6 +178,9 @@ async def watch(
     finally:
         observer.stop()
         observer.join(timeout=5)
+        # The socket goes before the claim: a path that outlived its server
+        # would have later commands dialling something that cannot answer.
+        await server.stop()
         claim.release()
 
     return reports

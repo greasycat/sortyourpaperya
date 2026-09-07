@@ -98,11 +98,14 @@ class PlannedFiling:
 class Library:
     """The store folder, the symlink tree, and the database that describes them."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self, root: Path, *, read_only: bool = False, fail_on_lock: bool = False
+    ) -> None:
         self.root = root
+        self.read_only = read_only
         self.store_dir = root / STORE_DIR
         self.tree_dir = root / TREE_DIR
-        self.db = PaperDb(root / DB_FILE)
+        self.db = PaperDb(root / DB_FILE, read_only=read_only, fail_on_lock=fail_on_lock)
 
     def close(self) -> None:
         self.db.close()

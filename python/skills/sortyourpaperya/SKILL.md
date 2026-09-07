@@ -274,16 +274,20 @@ Only one reading statement is accepted — `SELECT`, `WITH`, `FROM`, `TABLE`,
 it reaches the database. That is a guard against a query meant to count
 documents deleting them, not a permission boundary.
 
-Do not open `papers.duckdb` yourself with a DuckDB client. DuckDB allows one
-process at a time and refuses a second connection even to read, so it works
-only when no watcher is running — which is worse than not working, because it
-fails intermittently and for a reason that has nothing to do with the question.
+Do not open `papers.duckdb` yourself with a DuckDB client. A writer excludes
+every reader, so it works only when no pass is running — which is worse than not
+working, because it fails intermittently and for a reason that has nothing to do
+with the question. `sypy` handles that for you: it reads the database directly,
+and when a pass is holding it, asks the watcher instead.
 
 ## What not to run
 
-- **`sortyourpaperya ingest` and `sortyourpaperya watch` file new documents, and both send every
+- **`sypy ingest` and `sypy watch` file new documents, and both send every
   document's text to OpenAI and cost money.** Never run either to answer a
-  question. Run them only when the user asks for documents to be filed, and use
+  question. **The key `sypy login` stores belongs to the watcher**, so an ingest
+  run by hand does not spend it: with a watcher running the watcher does the
+  filing, and without one the command refuses unless `OPENAI_API_KEY` is set for
+  that run. Reading the library needs no key at all. Run them only when the user asks for documents to be filed, and use
   `--mode copy` unless they ask for `move`, which drains the source folder.
   `--input` takes a single PDF as well as a folder, so filing one document the
   user names is `sortyourpaperya ingest --input <file>.pdf --mode copy` — that
@@ -302,8 +306,14 @@ fails intermittently and for a reason that has nothing to do with the question.
 
 ## When something goes wrong
 
-- A command that hangs for a few seconds is waiting on the database lock — a
-  watcher may be mid-pass. It waits up to 30 seconds, then fails.
+- Reading always works, whether or not a watcher is running. `find`, `list`,
+  `categories`, `sql`, `cited`, and `read` open the database read-only, and
+  several readers coexist; if a pass is holding it, the watcher answers instead.
+  So a question about the library never needs a watcher and never waits for one.
+- A command that *changes* something can still pause for a few seconds when no
+  watcher is running and a pass is: it waits for the lock, up to 30 seconds,
+  then fails. With a watcher running there is nothing to wait for — it makes the
+  change itself.
 - `sortyourpaperya fsck` reports a document whose file is gone, or a folder the database
   does not know about. `--adopt` brings such a folder back in, losing the
   title, authors, and year, which only ever lived in the database.
