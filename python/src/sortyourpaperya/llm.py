@@ -549,3 +549,65 @@ class OpenAiClient:
         if not text:
             raise LlmError("the model returned no text for the rendered pages")
         return text
+
+
+class LazyOpenAiClient:
+    """An `OpenAiClient` that resolves the key when a request needs it.
+
+    The watcher needs a key to *spend*, but not to start, hold the write lock,
+    or serve the socket -- and those are what the other commands depend on it
+    for. Resolving the key at startup meant a watcher with no key stored could
+    not come up at all, so it could not answer a read during a pass either,
+    which is backwards. Worse, the service then failed on a ten second timer
+    until systemd gave up and parked it, so `sypy login` had to happen before
+    the restart or you had a unit to un-fail by hand.
+
+    Now it starts, serves, and watches; the first pass with no key logs one
+    failure and the loop carries on. `sypy doctor` reports that state as a
+    failure, which is where it belongs -- visible, not fatal.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        budget: Budget | None = None,
+        max_retries: int = DEFAULT_LLM_MAX_RETRIES,
+        timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+    ) -> None:
+        self._model = model
+        self._budget = budget
+        self._max_retries = max_retries
+        self._timeout_seconds = timeout_seconds
+        self._client: OpenAiClient | None = None
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def _resolved(self) -> OpenAiClient:
+        """The real client, built on first use.
+
+        Not cached across a failure: a key stored while the watcher runs is
+        picked up by the next pass, without a restart.
+        """
+        from .config import resolve_api_key
+
+        if self._client is None:
+            self._client = OpenAiClient(
+                resolve_api_key(),
+                self._model,
+                budget=self._budget,
+                max_retries=self._max_retries,
+                timeout_seconds=self._timeout_seconds,
+            )
+        return self._client
+
+    async def extract_keywords(self, *args, **kwargs):
+        return await self._resolved().extract_keywords(*args, **kwargs)
+
+    async def describe_pages(self, *args, **kwargs):
+        return await self._resolved().describe_pages(*args, **kwargs)
+
+    async def suggest_category(self, *args, **kwargs):
+        return await self._resolved().suggest_category(*args, **kwargs)

@@ -42,7 +42,7 @@ import shutil
 import subprocess
 
 from .library import FilingMode, Library, LibraryError
-from .llm import LlmError, OpenAiClient
+from .llm import LazyOpenAiClient, LlmError, OpenAiClient
 from . import recategorize
 from .naming import split_category
 from .registry import RegistryError, WatchEntry, load_registry, registry_path
@@ -281,8 +281,18 @@ def watch(
     # resolved. A command run by hand never reaches this line, which is the
     # whole point: the stored key is the watcher's to spend.
     becomes_the_spender()
-    settings, client = _build(
+    # The key is resolved by the first pass that needs it, not here. A watcher
+    # that cannot spend can still start, hold the write lock, and serve the
+    # socket -- which is what the other commands need from it -- so `sypy login`
+    # no longer has to happen before the service starts.
+    settings = _build_settings(
         input_dir, library_dir, recursive, page_cutoff, batch_size, model
+    )
+    client = LazyOpenAiClient(
+        settings.model,
+        budget=Budget(),
+        max_retries=env_int("SYP_LLM_MAX_RETRIES", DEFAULT_LLM_MAX_RETRIES),
+        timeout_seconds=env_float("SYP_LLM_TIMEOUT_SECONDS", DEFAULT_LLM_TIMEOUT_SECONDS),
     )
     try:
         with Library(settings.output_dir) as library:
@@ -2077,6 +2087,29 @@ def _settings(input_dir: Path | None, library_dir: Path | None, watch_name: str 
         raise typer.Exit(code=2) from err
 
 
+def _build_settings(
+    input_dir: Path | None,
+    library_dir: Path | None,
+    recursive: bool | None,
+    page_cutoff: int | None,
+    batch_size: int | None,
+    model: str | None,
+):
+    """Settings alone, for a caller that does not want a key resolved yet."""
+    try:
+        return resolve_settings(
+            input_dir,
+            _resolved_library(library_dir),
+            recursive=recursive,
+            page_cutoff=page_cutoff,
+            keyword_batch_size=batch_size,
+            model=model,
+        )
+    except ConfigError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=2) from err
+
+
 def _build(
     input_dir: Path | None,
     library_dir: Path | None,
@@ -2085,15 +2118,8 @@ def _build(
     batch_size: int | None,
     model: str | None,
 ):
+    settings = _build_settings(input_dir, library_dir, recursive, page_cutoff, batch_size, model)
     try:
-        settings = resolve_settings(
-            input_dir,
-            _resolved_library(library_dir),
-            recursive=recursive,
-            page_cutoff=page_cutoff,
-            keyword_batch_size=batch_size,
-            model=model,
-        )
         return settings, OpenAiClient(
             resolve_api_key(),
             settings.model,
