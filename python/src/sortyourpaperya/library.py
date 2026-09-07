@@ -28,15 +28,15 @@ from typing import Sequence
 
 import duckdb
 
+from .bib import BIBS_DIR
 from .db import Paper, PaperDb
 from .discovery import file_id as hash_file
 from .naming import disambiguate, link_name, parse_store_name, store_name
+from .notes import DEFAULT_NOTE, NoteError, note_name, notes_in
 
 log = logging.getLogger(__name__)
 
 STORE_DIR = "store"
-NOTE_SUFFIXES = (".md", ".json")
-DEFAULT_NOTE = "notes.md"
 TREE_DIR = "tree"
 DB_FILE = "papers.duckdb"
 
@@ -79,6 +79,7 @@ class BackupReport:
     database: Path
     documents: int
     bytes_copied: int
+    bibliographies: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,11 +98,14 @@ class PlannedFiling:
 class Library:
     """The store folder, the symlink tree, and the database that describes them."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self, root: Path, *, read_only: bool = False, fail_on_lock: bool = False
+    ) -> None:
         self.root = root
+        self.read_only = read_only
         self.store_dir = root / STORE_DIR
         self.tree_dir = root / TREE_DIR
-        self.db = PaperDb(root / DB_FILE)
+        self.db = PaperDb(root / DB_FILE, read_only=read_only, fail_on_lock=fail_on_lock)
 
     def close(self) -> None:
         self.db.close()
@@ -322,13 +326,17 @@ class Library:
         return report
 
     def backup(self, destination: Path) -> "BackupReport":
-        """Copy the library's two durable halves to `destination`.
+        """Copy everything durable in the library to `destination`.
 
         The store and the database are only useful together: the store without
         the database is a folder of documents nothing can find, and the database
         without the store is a catalogue of files that are gone. So they are
         copied by one command, in one place, rather than left as two things to
         remember.
+
+        `bibs/` goes with them. A bibliography is hand-made and derivable from
+        nothing, so leaving it out of the backup would make this command the
+        thing that loses it.
 
         **The database goes first.** Between the two copies a watcher may file
         another document, and which half is behind decides what the copy is
@@ -372,58 +380,55 @@ class Library:
             documents = sum(1 for entry in target.iterdir() if entry.is_dir())
             copied_bytes = _tree_bytes(target)
 
+        bibliographies = 0
+        bibs = self.root / BIBS_DIR
+        if bibs.is_dir():
+            try:
+                # `symlinks=True` for the same reason the store uses it, and
+                # more sharply: a bibliography's books are links into the
+                # store, and following them would copy every book a second
+                # time and restore as real files what were links.
+                shutil.copytree(bibs, destination / BIBS_DIR, symlinks=True)
+            except OSError as err:
+                raise LibraryError(f"could not copy the bibliographies: {err}") from err
+            bibliographies = sum(
+                1 for entry in (destination / BIBS_DIR).iterdir() if entry.is_dir()
+            )
+
         return BackupReport(
             destination=destination,
             database=destination / DB_FILE,
             documents=documents,
             bytes_copied=copied_bytes,
+            bibliographies=bibliographies,
         )
 
     def notes(self, paper: Paper) -> list[Path]:
         """Every note kept beside a document, in the order they read.
 
-        A note is any markdown or JSON file in the document's folder. The name
-        is its owner's to choose — `notes.md` is only the one this tool makes
-        when asked for a note and told nothing else.
-
         The document itself is never a note, even when it was filed as markdown
         or JSON: it is the thing the notes are about.
         """
-        folder = self.document_dir(paper)
-        if not folder.is_dir():
-            return []
-        return sorted(
-            entry
-            for entry in folder.iterdir()
-            if entry.is_file()
-            and entry.suffix.lower() in NOTE_SUFFIXES
-            and entry.name != paper.document_name
-        )
+        return notes_in(self.document_dir(paper), besides=[paper.document_name])
 
     def note_path(self, paper: Paper, name: str = DEFAULT_NOTE) -> Path:
         """Where a note of that name belongs, whether or not it exists yet.
 
-        A bare name is taken as markdown, so `reading-log` and `reading-log.md`
-        name the same file. A suffix that is neither markdown nor JSON is
-        refused rather than corrected: the caller meant a format this does not
-        keep, and renaming it for them would file it under a name they will not
-        look for.
+        `notes` owns what may be called a note; what is added here is that the
+        document's own file is not one, even when it was filed as markdown or
+        JSON: it is the thing the notes are about.
 
         Raises:
             LibraryError: if the name is not a plain filename, does not name a
                 note format, or is the document's own file.
         """
-        candidate = Path(name)
-        if candidate.name != name:
-            raise LibraryError(f"a note is named by a filename, not a path: {name!r}")
-        if not candidate.suffix:
-            candidate = candidate.with_suffix(".md")
-        if candidate.suffix.lower() not in NOTE_SUFFIXES:
-            kinds = " or ".join(NOTE_SUFFIXES)
-            raise LibraryError(f"a note is {kinds}, not {candidate.suffix}: {name!r}")
-        if candidate.name == paper.document_name:
+        try:
+            filename = note_name(name)
+        except NoteError as err:
+            raise LibraryError(str(err)) from err
+        if filename == paper.document_name:
             raise LibraryError(f"{name!r} is the document itself, not a note about it")
-        return self.document_dir(paper) / candidate.name
+        return self.document_dir(paper) / filename
 
     def migrate_store_layout(self) -> list[str]:
         """Move documents from the old flat store into a folder each.

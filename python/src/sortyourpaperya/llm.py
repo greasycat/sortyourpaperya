@@ -73,6 +73,7 @@ class LlmClient(Protocol):
         current: str = "",
         existing_categories: Sequence[str] = (),
         rejected: Sequence[str] = (),
+        guidance: str = "",
     ) -> CategorySuggestion: ...
 
 
@@ -149,6 +150,7 @@ def build_category_prompt(
     current: str = "",
     existing_categories: Sequence[str] = (),
     rejected: Sequence[str] = (),
+    guidance: str = "",
 ) -> str:
     """Build the prompt for re-asking where one document belongs.
 
@@ -161,6 +163,11 @@ def build_category_prompt(
 
     `rejected` is what makes asking twice worth anything: without it the same
     inputs return the same answer and "give me another" never moves.
+
+    `guidance` is what the person said when refusing was not enough — "it is
+    about the hardware, not the software", "file it near the tax papers". It is
+    the only input here that comes from someone who has read the document, so
+    it outranks every rule it touches.
     """
     sections = [
         "Say where this document belongs, and what it is about.",
@@ -192,6 +199,17 @@ def build_category_prompt(
             f"this document: {json.dumps(list(rejected))}. Do not return any of "
             "them, or a trivial rewording of one. Reconsider what the document "
             "is about rather than renaming the same idea"
+        )
+
+    if guidance:
+        # Last, so it is the most recent thing the model reads, and explicitly
+        # above the rejected list: someone who says "actually, file it with the
+        # tax papers" may be walking back a path they turned down two rounds
+        # ago, and a rule they cannot override is a rule that wastes requests.
+        sections.append(
+            "- The person filing this document has read it and says: "
+            f"{json.dumps(guidance)}. Follow it, and where it conflicts with "
+            "anything above, it wins"
         )
 
     if existing_categories:
@@ -454,6 +472,7 @@ class OpenAiClient:
         current: str = "",
         existing_categories: Sequence[str] = (),
         rejected: Sequence[str] = (),
+        guidance: str = "",
     ) -> CategorySuggestion:
         """Re-ask where one document belongs.
 
@@ -473,7 +492,7 @@ class OpenAiClient:
                     {
                         "role": "user",
                         "content": build_category_prompt(
-                            paper, current, existing_categories, rejected
+                            paper, current, existing_categories, rejected, guidance
                         ),
                     },
                 ],

@@ -35,11 +35,13 @@ async def suggest(
     page_cutoff: int,
     existing_categories: Sequence[str] = (),
     rejected: Sequence[str] = (),
+    guidance: str = "",
 ) -> CategorySuggestion:
     """Ask where `paper` belongs, avoiding anything in `rejected`.
 
-    One request. Raises `LlmError` if the model cannot be reached or says
-    nothing usable.
+    `guidance` is what the person watching said about this document — where
+    they think it goes, or what the model keeps missing about it. One request.
+    Raises `LlmError` if the model cannot be reached or says nothing usable.
     """
     return await client.suggest_category(
         PaperText(
@@ -51,6 +53,7 @@ async def suggest(
         current="/".join(paper.tags),
         existing_categories=existing_categories,
         rejected=rejected,
+        guidance=guidance,
     )
 
 

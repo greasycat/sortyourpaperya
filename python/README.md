@@ -141,7 +141,8 @@ sortyourpaperya backup ~/Backups/sortyourpaperya-2026-08-22
 
 The store and the database are only useful together — the store alone is a
 folder of documents nothing can find, the database alone is a catalogue of files
-that are gone — so one command copies both. `tree/` is skipped; `sortyourpaperya tree`
+that are gone — so one command copies both, along with `bibs/`, which is
+hand-made and derivable from nothing. `tree/` is skipped; `sortyourpaperya tree`
 rebuilds it.
 
 The database is copied first, and through DuckDB rather than as a file: a
@@ -171,6 +172,15 @@ library/
   tree/
     Machine Learning/Deep Learning/Transformers/
       vaswani_2017_attention-is-all-you-need -> ../../../store/5112ee75ddcf__...
+  bibs/
+    phd-thesis/
+      bib.toml              <- what you cite, and the file you edit
+      references.bib        <- generated from it, and the file LaTeX reads
+      notes.md              <- about the manuscript
+      notes/
+        knuth1984texbook.md <- about one thing it cites, in this manuscript
+      knuth_1984/
+        knuth_1984_the-texbook.pdf -> ../../../store/aa11bb22cc33__...
 ```
 
 Every document has one home: a folder in the store holding the document and
@@ -210,6 +220,9 @@ under different names is recognised.
 
 Expanding the schema means appending to `_MIGRATIONS` in `db.py`; anything not
 worth a column yet goes in `paper_attributes` as a key/value pair.
+
+`bibs/` is durable in the same way the store is — hand-made, derivable from
+nothing — so `sortyourpaperya backup` copies it too.
 
 ## Scanned documents
 
@@ -289,14 +302,32 @@ it. Without one it asks the model where the document belongs:
 suggestion 1: Cognitive Science / Computational Modelling
   keywords:   successor representations, temporal difference learning, …
 
-[a]ccept, [r]egenerate, [c]ancel [a]:
+[a]ccept, [s]teer, [r]egenerate, [c]ancel [a]:
 ```
 
 `r` asks again, and each round is told every category already turned down — so
 the model has to reconsider rather than reword. Without that the inputs would be
-identical each time and the answer would be too. There is no cap on how many
-times you may ask; each one is a request, numbered on screen so the count is
-visible, and the daily ceiling is what bounds it.
+identical each time and the answer would be too.
+
+`s` is for when refusing is not enough. It asks for a sentence — "it is about
+the maths, not the clinic", "file it near the tax papers" — and the next round
+is asked under it:
+
+```
+[a]ccept, [s]teer, [r]egenerate, [c]ancel [a]: s
+  what is it about, or where should it go?: it is about the maths, not the clinic
+
+suggestion 2: Mathematics / Probability
+  keywords:   markov decision processes, temporal difference learning, …
+  asked for:  it is about the maths, not the clinic
+```
+
+You are the one who has read the document, so what you say outranks everything
+else in the prompt, the rejected list included — a steer that walks back a path
+you turned down two rounds ago is allowed to. Saying it again replaces it
+rather than piling up; an empty answer costs nothing and brings the menu back.
+There is no cap on how many times you may ask; each one is a request, numbered
+on screen so the count is visible, and the daily ceiling is what bounds it.
 
 Accepting replaces the tags **and** the keywords, in one transaction, since
 taking the model's category and keeping its old keywords would describe the
@@ -314,6 +345,36 @@ file has gone missing both still get an answer, with no extra request.
 Nothing is written until you accept, and the database is let go before the first
 request: the exchange waits on a person, and holding the write lock across that
 would stop the watcher.
+
+## Reading a document
+
+```bash
+sortyourpaperya read kahn                  # the whole thing, on stdout
+sortyourpaperya read kahn --pages 1        # just the first page
+sortyourpaperya read kahn --pages 4-9      # a range
+sortyourpaperya read kahn --pages 10-      # the rest of it, however long
+```
+
+The text goes to stdout and nothing else does, so it pipes and substitutes.
+What was read — which pages, out of how many — goes to stderr, because a
+reader who got pages 1 to 5 of 300 should not have to work that out.
+
+A range past the end is clipped rather than refused: `--pages 10-` means the
+rest whatever its length. A *first* page past the end is an error, since an
+empty answer would read as a document with nothing in it.
+
+Layout is kept as the page has it, which is the difference between this and
+what ingest reads. Ingest collapses the first pages to one line because a
+request pays by the character; a reader wants the lines the document has.
+Nothing is sent anywhere and nothing is spent: this is `pypdf` on a local file.
+
+A scan has no text to extract. Where ingest has already paid to have its pages
+read, that reading is printed instead and stderr says so — it is the document's
+own words in one case and a model's reading of a picture in the other, and
+nothing downstream can tell them apart afterwards. A scan nobody has read yet
+says so, and says that `sortyourpaperya ingest` is what reads one.
+
+Only what the text layer holds. OCR and figures are not done here.
 
 ## Notes
 
@@ -339,6 +400,203 @@ Notes are just files in the folder, so anything else you put there — figures,
 supplements, a scanned appendix — gets the same treatment, minus being reported
 as a note. All of it is backed up with the document, follows it through a
 re-tag, and is deleted with it, which is why `sortyourpaperya remove` asks first.
+
+## Bibliographies
+
+A library keeps the papers you cite; `bib` keeps what you cite them in. One
+bibliography per manuscript, under `bibs/<slug>/`:
+
+```bash
+sortyourpaperya bib init "PhD Thesis"                       # bibs/phd-thesis/
+sortyourpaperya bib add --lib phd-thesis --cite 5112ee75ddcf
+```
+
+`--link` puts a link to the whole bibliography folder in the directory you ran
+the command from, which is how a manuscript reaches all of it through one name:
+
+```bash
+cd ~/papers/thesis
+sortyourpaperya bib init "PhD Thesis" --link      # ./thesis -> <library>/bibs/phd-thesis
+```
+
+```latex
+\addbibresource{thesis/references.bib}
+```
+
+It works on `bib add` too, so a bibliography started elsewhere is reached from
+here without going and finding it. The link is absolute, unlike the tree's,
+which are relative so the library can be moved as a whole: here the two ends
+are independent trees that move for unrelated reasons, and a relative link is
+the one that breaks when either does. Nothing already in the way is replaced —
+deciding a file someone else put there is stale is not this tool's call.
+
+Leave off `--lib`, `--cite`, or both and you are asked, with the bibliographies
+listed and the first offered as the default — so a library with one takes a
+keystroke, and a library with several cannot have the wrong one picked for it.
+A bibliography answers to its slug or to its id, so a script that recorded the
+id keeps working across a rename.
+
+Each one holds two files:
+
+```toml
+# bibs/phd-thesis/bib.toml — the record, and the one you edit
+id = "add9918a7e03"
+slug = "phd-thesis"
+name = "PhD Thesis"
+
+[[source]]
+key = "vaswani2017attention"
+type = "article"
+file_id = "5112ee75ddcf"
+title = "Attention Is All You Need"
+author = ["Ashish Vaswani", "Noam Shazeer"]
+year = 2017
+doi = "10.48550/arXiv.1706.03762"
+journal = "NeurIPS"
+```
+
+```bibtex
+% bibs/phd-thesis/references.bib — generated from it, and the one LaTeX reads
+@article{vaswani2017attention,
+  title = {{Attention Is All You Need}},
+  author = {Ashish Vaswani and Noam Shazeer},
+  year = {2017},
+  doi = {10.48550/arXiv.1706.03762},
+  journal = {NeurIPS},
+}
+```
+
+**The TOML is the source of truth and the `.bib` is a projection of it**, the
+same way the database is the truth behind the store's filenames. So a field the
+library never knew — a page range, a corrected title, a source that is not in
+the library at all — is added by editing `bib.toml` and running
+`sortyourpaperya bib build`. Nothing you write into `references.bib` survives
+the next write; the file says so in its own header.
+
+Every key in a `[[source]]` table except `key`, `type`, `file_id`, and
+`added_at_ms` is a BibTeX field, carried through as written, so the record can
+hold a field this tool has never heard of.
+
+Title, authors, and year come from the library's own columns. Everything else
+comes from the document's attributes, so this is what `sortyourpaperya attr`
+is for:
+
+```bash
+sortyourpaperya attr 5112ee75ddcf doi 10.48550/arXiv.1706.03762
+sortyourpaperya attr 5112ee75ddcf journal NeurIPS
+```
+
+Only attribute keys that name a BibTeX field are carried across — `doi`,
+`journal`, `booktitle`, `publisher`, `volume`, `pages`, `url` and the rest — so
+a verdict or a reading date kept on the same document stays out of the
+bibliography. The entry type follows from what is there: a `journal` makes it
+an `@article`, a `booktitle` an `@inproceedings`, a `school` a `@phdthesis`,
+and nothing at all leaves it `@misc`, since a document filed by this tool is
+not assumed to be a paper. `--type` overrules all of it.
+
+The citation key is `vaswani2017attention` — surname, year, and the first word
+of the title that names something, which is the spelling nearly every reference
+manager produces and so the one you will guess at when typing `\cite{`. Two
+papers by the same author in the same year get `…attention` and `…attentionb`,
+the way BibTeX itself answers a collision. `--key` names one outright, and is
+told if the name was taken.
+
+Citing a document twice does nothing: a source records the `file_id` it came
+from, so the second `bib add` reports the key it already has.
+
+TeX's special characters are escaped on the way into the `.bib` and left alone
+in the record, so a title carrying `&`, `%`, or `_` is text in both. Titles are
+double-braced, because a BibTeX style will otherwise lowercase a title that was
+already capitalized the way its authors capitalized it.
+
+A document with no author — a bill, a manual — draws
+`Warning--to sort, need author or key` from classic BibTeX under a style that
+sorts by author, and is sorted first. The entry is written and the run
+succeeds; it is what citing an authorless document costs, and `biblatex` does
+not mind at all.
+
+### Books, which you write alongside
+
+A cited **book** is linked into the bibliography as well as written into it:
+
+```
+bibs/phd-thesis/
+  knuth_1984/
+    knuth_1984_the-texbook.pdf -> ../../../store/aa11bb22cc33__Reference/
+```
+
+A paper is read once and cited; a book you go back to, and to a chapter at a
+time, so it is the one worth having at hand — and because it lives inside the
+bibliography, the one `--link` carries it along to the manuscript.
+
+The folder is named for the author and year, the way a shelf is arranged. A
+second book by the same author in the same year adds its title —
+`knuth_1984_concrete-mathematics` — and a third that matches on that too is
+refused, because at that point nothing in the record tells them apart and one
+folder would quietly hold both. A book with no author is filed under its
+citation key, which is unique within a bibliography and so cannot collide.
+
+The link points at the document's folder in the store, exactly as the tree's
+links do, so opening it lands on the book and on whatever is kept beside it.
+Only `@book` is shelved; `--type book` is how you say a document is one.
+
+### Which bibliographies cite a document
+
+```bash
+sortyourpaperya cited vaswani
+```
+
+```
+phd-thesis                vaswani2017attention
+review-2026               vaswani2017attention
+```
+
+The question `bib add` answers in one direction, asked in the other: not what
+this manuscript cites, but where you have already used this. Every `find --json`
+and `list --json` record carries the same thing as `cited_by`, and
+`sortyourpaperya remove` names it before asking to confirm — a citation survives
+the document being deleted and keeps working, since it is a claim about a paper
+and not about a file you hold, but it stops leading anywhere, and that is worth
+knowing while the choice is still open.
+
+**Nothing is stored to answer this.** Each bibliography's record already names
+the `file_id` it cites, so the answer is those records read backwards. A stored
+index would be a third thing to keep in step with the record and the `.bib`, and
+would be wrong for exactly as long as it took someone to notice; this cannot
+disagree with the record because it *is* the record, and a hand-edited
+`bib.toml` is answered correctly the moment it is saved, with nothing to
+rebuild. A page of records reads the bibliographies once, not once per row.
+
+A source with no `file_id` — a book cited by hand, something not in this library
+— cites no document here and appears nowhere in the answer.
+
+### Notes on the manuscript, and on what it cites
+
+```bash
+sortyourpaperya bib note --lib thesis --path                    # about the manuscript
+sortyourpaperya bib note outline --lib thesis --path            # ...a note by name
+sortyourpaperya bib note --lib thesis --cite vaswani --path     # about one cited source
+sortyourpaperya bib note ch3 --lib thesis --cite vaswani --path # ...a second one
+```
+
+Same rules as a document's notes: any markdown or JSON file is one, a bare word
+means markdown, and a bibliography with several notes lists them rather than
+guessing which you meant.
+
+A note on a cited source is `notes/<key>.md`, named by the citation key, and a
+second is `notes/<key>-<name>.md`. Every one carries the key because they share
+a folder — an `outline.md` in there would say nothing about whose outline it is.
+
+**This is deliberately not `sortyourpaperya note <id>`.** That note describes
+the document and is shared by every bibliography citing it; this one is what
+the document does for *this* manuscript — why it is in chapter 3, which claim
+it supports, what you disagree with. The two do not belong in one file, and a
+document dropped from one manuscript should not take the other's notes with it.
+
+`--cite` takes a citation key as well as a document. The key is tried first and
+exactly, so notes can still be opened on a source whose document has since left
+the library: the bibliography still cites it, and what you wrote is still worth
+reading.
 
 ## Reading the library from a program
 
@@ -456,8 +714,9 @@ without ingesting into it.
 
 It finds a Python 3.11 or newer — trying `python3.14` down to `python3`, since
 a distribution's `python3` is often older than the newest it also ships —
-builds a virtualenv inside the project, installs the pinned dependencies, and
-links `sortyourpaperya` into `~/.local/bin`, and links the agent skill into
+builds a virtualenv inside the project, links the command into `~/.local/bin`
+under both its names — `sortyourpaperya` and the short `sypy`, which run the
+same thing — and links the agent skill into
 `~/.claude/skills`. Nothing is written outside the project, those two
 directories, and (with `--service`) the supervisor's config — and the last two
 get a symlink each.
@@ -473,11 +732,16 @@ Override where things go with `SORTYOURPAPERYA_VENV_DIR`, `SORTYOURPAPERYA_BIN_D
 
 ## Usage
 
+Every command below is spelled `sortyourpaperya` in full. `sypy` is the same
+command under a shorter name — both are installed, and the short one is what
+you will actually type.
+
 ```bash
 
 sortyourpaperya ingest --input ./inbox                 # preview: nothing is written
 sortyourpaperya ingest --input ./inbox --mode copy     # copy in, leave the source alone
 sortyourpaperya ingest --input ./inbox --mode move     # move in, draining the source
+sortyourpaperya ingest --input ./paper.pdf --mode copy # or one document by name
 sortyourpaperya watch  --input ./inbox --mode copy     # keep doing it as documents arrive
 
 sortyourpaperya list                              # what the library holds
@@ -485,6 +749,8 @@ sortyourpaperya list --json                       # ...as records, for a program
 sortyourpaperya list --sort recent                # id (default), recent, updated, title, year, size
 sortyourpaperya find "attention 2017"             # by title, author, keyword, tag, year, or id
 sortyourpaperya categories                        # every category in use, and how many are under it
+sortyourpaperya read <id>                         # the document's text, on stdout
+sortyourpaperya read <id> --pages 1-5             # ...a range of it
 sortyourpaperya attr <id>                         # free key/value pairs kept on a document
 sortyourpaperya attr <id> doi 10.1000/xyz         # ...set one; --unset forgets it
 sortyourpaperya sql "SELECT ..."                  # the database directly, reading only
@@ -494,6 +760,14 @@ sortyourpaperya note kahn                         # id or words: any command tak
 sortyourpaperya note <id>                         # open this document's notes ($EDITOR)
 sortyourpaperya note <id> reading-log             # ...a note by name; .md unless you say .json
 sortyourpaperya note <id> --path                  # ...or just say where they are
+sortyourpaperya bib init "PhD Thesis" --link      # start one, and link it into ./
+sortyourpaperya bib add --lib thesis --cite <id>  # cite a document in it
+sortyourpaperya bib note --lib thesis --path      # notes on the manuscript
+sortyourpaperya bib note --lib thesis --cite <id> --path   # ...on one cited source
+sortyourpaperya bib add                           # ...or be asked which, and which
+sortyourpaperya bib build --lib thesis            # re-generate the .bib from bib.toml
+sortyourpaperya bib list                          # every bibliography in the library
+sortyourpaperya cited <id>                        # which bibliographies cite a document
 sortyourpaperya remove <id>                       # delete link, folder, and record (asks first)
 sortyourpaperya scan                              # refresh hashes of files edited in place
 sortyourpaperya fsck [--adopt]                    # check the store and database agree
@@ -508,6 +782,14 @@ sortyourpaperya cache [--forget]                  # model answers already paid f
 Nothing is written without `--mode`. Use `copy` for a folder you did not create
 — a Downloads folder keeps its files and the library gets copies. Re-run `wire`
 after changing dependencies.
+
+`--input` takes a folder or a single PDF, so one document can be filed without
+first putting it in a folder of its own and without the rest of the folder it
+sits in coming along. Naming a file that is not a PDF, or a path that is not
+there, is refused outright: the scan behind `--input` answers an unusable path
+with an empty list — deliberately, since a folder deleted under a running
+watcher must not take the service down — and that same silence would otherwise
+answer a typo with "filed 0 document(s)", which reads as "nothing new here".
 
 ## The registry
 
@@ -693,10 +975,119 @@ spend ledger — is `SORTYOURPAPERYA_STATE_DIR`, defaulting to `~/.local/state/s
 registry is `SORTYOURPAPERYA_CONFIG_DIR`, and `SORTYOURPAPERYA_LOG_FILE` turns on the rotating log
 (the service sets it; a second process rotating the same file can lose lines).
 
-The API key is read from `OPENAI_API_KEY`, `SYP_API_KEY`, or `OEPNAI_API_KEY`,
+Inside the watcher the API key comes from the keychain first, then from
+`OPENAI_API_KEY`,
+`SYP_API_KEY`, or `OEPNAI_API_KEY`,
 including from the repository-root `.env`. The third spelling is a typo this
 repo's `.env` currently carries; it is accepted so the tool works as-is,
 and the correct spelling wins when both are set.
+
+## Is it working
+
+```bash
+sypy doctor              # the watcher and the model, in one command
+sypy doctor --offline    # ...without the call that checks the key
+```
+
+Every check is one line saying `ok`, `warn`, or `FAIL`, and anything that
+failed is repeated at the end as the command that fixes it. It exits non-zero
+when something is wrong, so a script can gate on it.
+
+It checks that `pdftoppm` is there (without it, documents with no text layer
+fail and nothing else does), that each declared watch has a folder to watch and
+a library to write to, and whether anything is actually running — separating
+*stopped* from *a service is installed and yet nothing is running*, which is
+the case worth catching: the folder looks watched and nothing has been filed
+for a week. Then the model, and what the day's spend has left.
+
+The key it asks the **watcher** about, because the watcher is what spends it and
+the only process that can see it — including whether the API actually accepts
+it, which the watcher checks on request, so an expired key is still caught. A watcher running without a key is a failure
+worth shouting about — it will die on the first document it is handed. No watcher
+running is only a warning: the stored key is not readable from here by design, so
+"I cannot see one" says nothing about whether the service has one.
+
+The API check lists models rather than labelling anything. That call is free,
+so `doctor` never costs money; `--offline` skips it anyway. Checking only that
+a key *exists* is the check that lulls you — an expired key looks exactly like
+a working one until the first document.
+
+## The watcher, and what talks to it
+
+While `sypy watch` runs it serves a Unix socket for its library, and the other
+commands use it. It is not a separate process to start: the watcher already
+holds the write connection, and `watchlock` already guarantees one per library,
+which is what makes "the watcher for this library" a well-defined thing to
+address rather than a race.
+
+Three routes, by what a command needs:
+
+| | with a watcher running | with none |
+|---|---|---|
+| **read** — `find` `list` `categories` `sql` `cited` `read` | direct, read-only; the watcher answers only while a pass holds the lock | direct |
+| **change** — `attr` `remove` `retag` `fsck` `scan` `tree` `migrate-store` `cache` `backup` | the watcher makes the change | in-process, waiting for the lock as before |
+| **spend** — `ingest` | the watcher files it, with its key | refused unless `OPENAI_API_KEY` is set for the run |
+
+**Reads deliberately do not go through the watcher.** Several read-only
+connections coexist, so a question about the library is answered whether or not
+anything is serving — an agent asking what you have filed never depends on a
+background process being up. The one case that excludes readers is a pass
+holding the write lock, and that is exactly when the watcher can answer, so the
+fallback costs a round trip instead of a thirty-second wait.
+
+Nothing starts a watcher on your behalf. A read command that silently launched a
+background process which spends money is the opposite of the point.
+
+The socket lives in the runtime directory (`XDG_RUNTIME_DIR`, or `TMPDIR` on
+macOS), one per library, mode `0600`. Not under the home directory with the rest
+of the state: a socket path is capped near 104 bytes, and a library a few folders
+deep would fail at `bind` with nothing but "path too long" to go on.
+
+## The API key
+
+```bash
+sypy login       # prompts, stores it in the system keychain
+sypy logout      # forget it
+```
+
+macOS Keychain and the Linux Secret Service, whichever the machine has. Both
+unlock when you log in, so the watcher has the key after a reboot without
+anything being typed — which a key exported in `.zshrc` does not, because
+neither launchd nor systemd inherits the shell that installed the service.
+
+**The stored key is the watcher's.** That is what `login` is for: a background
+process cannot be handed a key any other way. It does not follow that every
+command run by hand should quietly spend it, and the surprise there is
+expensive — an `ingest` typed at a prompt looks free until the bill.
+
+So **only `login`, `logout`, and the watcher ever read the keychain.** No other
+command touches it, not even to write a better error message: reading it is what
+makes a locked keyring put a password dialog in front of whoever is sitting
+there. `whoami` and `doctor` ask the watcher instead, since it is the process
+that would spend.
+
+Be exact about the guarantee. A hand-typed `sypy ingest` still causes spending
+when a watcher is running — the watcher does the filing, on its key, and prints
+what it filed. What cannot happen is a command quietly reading the stored key and
+spending it *itself*, unattributed. When routing like that, `--input` is
+required: `ingest` otherwise files the current directory, which is a local
+mistake when the key is in your shell and a spend on the service's key when it
+is not.
+
+`OPENAI_API_KEY` still works everywhere, and is unaffected by any of this. Setting
+it for one command is a deliberate act with a key you chose for that run, which is
+the opposite case. For the watcher the keychain wins over the environment, so
+`login` is not shadowed by a profile still exporting last year's key.
+
+`--key` takes the value directly, for a script. Without it the prompt is
+hidden, so the key is not left in shell history.
+
+A machine with no keychain — a container, a headless box with no Secret Service
+— is not an error: it falls through to the environment, which is what a
+container was going to use anyway. Nothing that worked before stops working.
+
+`sypy whoami` says where the key is coming from, and prints its last
+four characters rather than the key.
 
 ## Known gaps
 

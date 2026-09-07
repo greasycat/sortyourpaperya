@@ -53,7 +53,7 @@ Each record looks like this:
 }
 ```
 
-`document` is the file — open it to read the document. `id` is what every
+`document` is the file. `id` is what every
 other command takes. Those commands accept words too, but **pass the id you got
 from `find`**: a word matching two documents is an error you then have to
 resolve, and the id you already have cannot be ambiguous. `from_page_images: true` means the title, authors and year
@@ -81,6 +81,34 @@ hand.
 Both commands, and the ones below, take `--library <path>` when the user names a
 library. Without it `sortyourpaperya` resolves the one this machine watches, which is
 usually right.
+
+## Read it
+
+```bash
+sortyourpaperya read 5112ee75ddcf                 # the whole document, on stdout
+sortyourpaperya read 5112ee75ddcf --pages 1       # just the first page
+sortyourpaperya read 5112ee75ddcf --pages 4-9     # a range
+```
+
+The document's text, extracted from its text layer. Free and local — no request
+is sent and nothing is spent — so read the document rather than guessing from
+its title and keywords whenever a question is about what it actually says.
+
+**Check the length before reading a long one.** The record's `pages_read` is
+what the model looked at, not how long the document is; `read --pages 1` returns
+the first page and tells you the total on stderr. A 300-page manual read whole
+will fill your context with pages nobody asked about — use a range.
+
+Stdout is only the text, so `sortyourpaperya read <id> | grep -i "method"` works
+for finding a passage without reading the whole thing.
+
+A scanned document has no text layer. If ingest has already paid to have its
+pages read, that reading is printed and stderr says so — treat it as a model's
+reading of a picture rather than the document's own words, and say so if it
+matters. If nothing has read it, the command says that too; do not run `ingest`
+to fix it, because that spends money.
+
+Only the text layer. There is no OCR and no figure extraction here.
 
 ## Record something about it
 
@@ -138,6 +166,74 @@ there is backed up with it, follows it when it is re-tagged, and is deleted with
 it. Nothing written into `tree/` is durable: it is rebuilt from the database and
 not backed up.
 
+## Cite it in a paper
+
+```bash
+sortyourpaperya bib list --json                                  # which bibliographies exist
+sortyourpaperya bib add --lib thesis --cite 5112ee75ddcf         # cite one document in one
+sortyourpaperya bib add --lib thesis --cite 5112ee75ddcf --link  # ...and link the folder into ./
+```
+
+A bibliography lives at `bibs/<slug>/` inside the library. It holds `bib.toml`,
+the record, and `references.bib`, generated from it — the one to point LaTeX at
+— plus its notes and any books it cites. `bib add` writes both files. It reports
+the citation key it used, which is what goes inside `\cite{}`.
+
+`--link` puts a link to the whole folder in the directory the command ran in, so
+a manuscript reaches all of it as `thesis/references.bib`. Use it when the user
+is working in a paper directory and wants the bibliography reachable from there;
+it is safe to pass twice, and it never replaces anything already in the way.
+
+A cited **book** is also linked into the bibliography, under a folder named for
+its author and year (`bibs/thesis/knuth_1984/`). Only `@book` is; pass
+`--type book` when a document is one and the library has no `publisher` on it.
+
+**Always pass both `--lib` and `--cite`.** Either one left out is asked for at
+a prompt you cannot answer.
+
+Fill in what the entry needs *before* citing it, with `attr`: `doi`, `journal`,
+`booktitle`, `publisher`, `volume`, `number`, `pages`, `url`, and the rest of
+the BibTeX field names are carried into the entry, and the entry type follows
+from them — a document with a `journal` is an `@article`, one with a
+`booktitle` an `@inproceedings`, and one with neither `@misc`. Pass `--type` to
+say outright. Attributes that are not BibTeX field names stay out of the
+bibliography, so a verdict or a reading date is safe to keep on a document.
+
+To correct or add anything afterwards, edit `bib.toml` and run
+`sortyourpaperya bib build --lib <slug>`. **Never edit `references.bib`** — it
+is regenerated from the TOML and the next `bib add` overwrites it.
+
+### Notes scoped to a manuscript
+
+```bash
+sortyourpaperya bib note --lib thesis --path                 # about the manuscript
+sortyourpaperya bib note --lib thesis --cite vaswani2017attention --path   # about one source
+```
+
+Prints the path, creating the note if it does not exist. **Always pass `--lib`,
+and always pass `--path`** — without `--lib` you are asked at a prompt you
+cannot answer, and without `--path` the command opens `$EDITOR` and hangs.
+
+A source note is `notes/<key>.md`. `--cite` takes the citation key or the
+document; prefer the key, which you already have from `bib add` or `bib list`.
+
+**Choose the right note.** `sortyourpaperya note <id>` describes the *document*
+and is shared by every bibliography citing it — a summary, what it measured,
+where its data is. `bib note --cite` is what that document does for *this*
+manuscript — why it is in chapter 3, which claim it supports, what to push back
+on. Writing the second kind into the first leaks one paper's argument into
+every other paper that cites the same document.
+
+Citing the same document twice does nothing and says so; it does not duplicate
+the entry. `sortyourpaperya bib init "<name>"` starts a new bibliography, one
+per manuscript.
+
+To ask it the other way round — where have I already used this document —
+`sortyourpaperya cited <id>` names every bibliography citing it and the key each
+uses, and every `find --json` and `list --json` record carries the same under
+`cited_by`. Check it before suggesting a document be removed: the citation
+survives and keeps working, but stops leading anywhere.
+
 ## Re-file a document
 
 ```bash
@@ -165,10 +261,10 @@ The commands above cover the questions worth having a command for. This is the
 rest of the database, and it is a lot: `papers` (with `content_hash`,
 `size_bytes`, `pages_read`, `stored_mtime_ms`, `created_at_ms`,
 `updated_at_ms`), `paper_tags`, `paper_authors`, `paper_keywords`,
-`paper_attributes`, and `model_answers` — whose `page_text` column holds the
-text already extracted from each document's first pages. Reading that is free
-and already paid for; re-parsing the PDF to answer a question about its
-contents is not.
+`paper_attributes`, and `model_answers` — whose `page_text` column holds what
+a model read off the pages of a document that had no text layer. That is only
+scans, and `sortyourpaperya read` already hands it to you: for a document's
+contents, use `read`, not a query.
 
 `DESCRIBE papers` shows the columns of any of them. Join on `file_id`, except
 `model_answers`, which is keyed by `content_hash`.
@@ -178,29 +274,46 @@ Only one reading statement is accepted — `SELECT`, `WITH`, `FROM`, `TABLE`,
 it reaches the database. That is a guard against a query meant to count
 documents deleting them, not a permission boundary.
 
-Do not open `papers.duckdb` yourself with a DuckDB client. DuckDB allows one
-process at a time and refuses a second connection even to read, so it works
-only when no watcher is running — which is worse than not working, because it
-fails intermittently and for a reason that has nothing to do with the question.
+Do not open `papers.duckdb` yourself with a DuckDB client. A writer excludes
+every reader, so it works only when no pass is running — which is worse than not
+working, because it fails intermittently and for a reason that has nothing to do
+with the question. `sypy` handles that for you: it reads the database directly,
+and when a pass is holding it, asks the watcher instead.
 
 ## What not to run
 
-- **`sortyourpaperya ingest` and `sortyourpaperya watch` file new documents, and both send every
+- **`sypy ingest` and `sypy watch` file new documents, and both send every
   document's text to OpenAI and cost money.** Never run either to answer a
-  question. Run them only when the user asks for documents to be filed, and use
+  question. **The key `sypy login` stores belongs to the watcher**, so an ingest
+  run by hand does not spend it: with a watcher running the watcher does the
+  filing, and without one the command refuses unless `OPENAI_API_KEY` is set for
+  that run. Reading the library needs no key at all. Run them only when the user asks for documents to be filed, and use
   `--mode copy` unless they ask for `move`, which drains the source folder.
+  `--input` takes a single PDF as well as a folder, so filing one document the
+  user names is `sortyourpaperya ingest --input <file>.pdf --mode copy` — that
+  is one request paid for, where naming its folder would file everything else
+  sitting in it too.
 - **`sortyourpaperya remove` deletes the document, its notes, and its record.** When the
   document arrived by move, that is the only copy. Ask first, every time; pass
   `--yes` only after the user has said yes to that document, and only with an
   exact id — `--yes` refuses words, because what a word matches changes as the
   library grows.
+- `sortyourpaperya bib init`, `bib add`, and `bib note` write inside `bibs/`,
+  and `--link` writes one symlink into the current directory. A bibliography is
+  the user's manuscript: run them when asked, not to tidy up.
 - `sortyourpaperya fsck`, `scan`, `tree`, `migrate-store`, and `backup` are maintenance.
   They are safe, but run them when asked, not speculatively.
 
 ## When something goes wrong
 
-- A command that hangs for a few seconds is waiting on the database lock — a
-  watcher may be mid-pass. It waits up to 30 seconds, then fails.
+- Reading always works, whether or not a watcher is running. `find`, `list`,
+  `categories`, `sql`, `cited`, and `read` open the database read-only, and
+  several readers coexist; if a pass is holding it, the watcher answers instead.
+  So a question about the library never needs a watcher and never waits for one.
+- A command that *changes* something can still pause for a few seconds when no
+  watcher is running and a pass is: it waits for the lock, up to 30 seconds,
+  then fails. With a watcher running there is nothing to wait for — it makes the
+  change itself.
 - `sortyourpaperya fsck` reports a document whose file is gone, or a folder the database
   does not know about. `--adopt` brings such a folder back in, losing the
   title, authors, and year, which only ever lived in the database.

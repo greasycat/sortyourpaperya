@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FailingLlmClient, FakeLlmClient
+from conftest import FailingLlmClient, FakeLlmClient, write_pdf, write_scanned_pdf
 from sortyourpaperya.cli import LOG_BACKUP_COUNT, LOG_MAX_BYTES, _configure
 
 
@@ -333,6 +333,50 @@ def test_regenerating_never_offers_the_same_category_twice(library) -> None:
         "Cognitive Science/Computational Modelling",
         "Neuroscience/Learning",
     ]
+
+
+def test_a_steer_is_carried_into_the_next_suggestion(library) -> None:
+    """Refusing says only "not that". Someone who has read the document knows more."""
+    root = _misfiled(library)
+    fake = FakeLlmClient()
+
+    result = _retag(
+        root, fake, "78c64b3b8ef6", input="s\nit is about the maths, not the clinic\na\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(fake.suggestions) == 2
+    assert fake.suggestions[0].guidance == ""
+    assert fake.suggestions[1].guidance == "it is about the maths, not the clinic"
+    assert fake.suggestions[1].rejected == ["Cognitive Science/Computational Modelling"], (
+        "a steer is still a refusal of what was on screen"
+    )
+    assert "it is about the maths" in result.output, "shown with the answer it produced"
+
+
+def test_a_later_steer_replaces_the_one_before_it(library) -> None:
+    """Someone correcting their own instruction means the newer sentence."""
+    root = _misfiled(library)
+    fake = FakeLlmClient()
+
+    _retag(root, fake, "78c64b3b8ef6", input="s\nthe maths\ns\nno, the hardware\nc\n")
+
+    assert [call.guidance for call in fake.suggestions] == [
+        "",
+        "the maths",
+        "no, the hardware",
+    ]
+
+
+def test_saying_nothing_at_the_steer_prompt_costs_no_request(library) -> None:
+    """An empty answer is not a decision, so the menu comes back."""
+    root = _misfiled(library)
+    fake = FakeLlmClient()
+
+    result = _retag(root, fake, "78c64b3b8ef6", input="s\n\nc\n")
+
+    assert result.exit_code == 0, result.output
+    assert len(fake.suggestions) == 1, "nothing was asked again"
 
 
 def test_the_model_is_told_where_the_document_sits_now(library) -> None:
@@ -847,3 +891,581 @@ def test_sql_says_when_it_capped_the_rows(library) -> None:
     result = _invoke(root, "sql", "SELECT title FROM papers", "--limit", "1")
 
     assert "more than 1 rows matched" in result.output
+
+
+# ---- bibliographies ---------------------------------------------------------
+
+
+def _cited(library, **overrides):
+    """A filed document worth citing, with a DOI a reader put on it."""
+    from sortyourpaperya.db import Paper
+
+    fields = {
+        "file_id": "78c64b3b8ef6",
+        "content_hash": "sha-vaswani",
+        "store_name": "78c64b3b8ef6__AI",
+        "document_name": "vaswani_2017_attention.pdf",
+        "title": "Attention Is All You Need",
+        "authors": ["Ashish Vaswani"],
+        "year": 2017,
+        "tags": ["AI"],
+    }
+    fields.update(overrides)
+    paper = Paper(**fields)
+    library.db.upsert(paper)
+    library.db.set_attribute(paper.file_id, "doi", "10.1000/xyz")
+    folder = library.document_dir(paper)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / paper.document_name).write_bytes(b"%PDF-1.4 not a real pdf")
+    root = library.root
+    library.close()
+    return root, paper
+
+
+def test_bib_init_makes_a_bibliography_and_says_where(library) -> None:
+    root = library.root
+    library.close()
+
+    result = _invoke(root, "bib", "init", "PhD Thesis")
+
+    assert result.exit_code == 0, result.output
+    assert "phd-thesis" in result.stdout
+    assert (root / "bibs" / "phd-thesis" / "bib.toml").is_file()
+    assert (root / "bibs" / "phd-thesis" / "references.bib").is_file()
+
+
+def test_bib_add_told_both_halves_writes_the_entry(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    written = (root / "bibs" / "thesis" / "references.bib").read_text()
+    assert "@misc{vaswani2017attention," in written
+    # The DOI a reader put on the document, which the model was never asked for.
+    assert "doi = {10.1000/xyz}," in written
+
+
+def test_bib_add_names_the_document_by_words(library) -> None:
+    """The same way every other command names one."""
+    root, _ = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", "vaswani")
+
+    assert result.exit_code == 0, result.output
+    assert "vaswani2017attention" in result.stdout
+
+
+def test_bib_add_asks_for_whichever_half_it_was_not_given(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "init", "Paper")
+
+    # Two bibliographies, so neither can be picked without being asked for.
+    result = _invoke(root, "bib", "add", input=f"thesis\n{paper.file_id}\n")
+
+    assert result.exit_code == 0, result.output
+    assert "thesis" in result.stderr and "paper" in result.stderr
+    assert "@misc{vaswani2017attention," in (
+        root / "bibs" / "thesis" / "references.bib"
+    ).read_text()
+
+
+def test_the_only_bibliography_is_offered_as_the_default(library) -> None:
+    """One keystroke when there is only one, and still never a silent guess."""
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--cite", paper.file_id, input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "vaswani2017attention" in result.stdout
+
+
+def test_citing_a_document_twice_changes_nothing(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "already in thesis as vaswani2017attention" in result.stdout
+    written = (root / "bibs" / "thesis" / "references.bib").read_text()
+    assert written.count("@misc{") == 1
+
+
+def test_bib_add_without_a_bibliography_says_how_to_make_one(library) -> None:
+    root, paper = _cited(library)
+
+    result = _invoke(root, "bib", "add", "--cite", paper.file_id)
+
+    assert result.exit_code == 1
+    assert "bib init" in result.stderr
+
+
+def test_an_unknown_bibliography_is_refused_rather_than_guessed_at(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--lib", "nope", "--cite", paper.file_id)
+
+    assert result.exit_code == 1
+    assert "no bibliography" in result.stderr
+
+
+def test_bib_build_regenerates_the_bib_from_a_hand_edited_record(library) -> None:
+    """The TOML is the record; this is what makes editing it the way to work."""
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    record = root / "bibs" / "thesis" / "bib.toml"
+    record.write_text(record.read_text().replace('type = "misc"', 'type = "article"'))
+    result = _invoke(root, "bib", "build", "--lib", "thesis")
+
+    assert result.exit_code == 0, result.output
+    assert "@article{vaswani2017attention," in (
+        root / "bibs" / "thesis" / "references.bib"
+    ).read_text()
+
+
+def test_bib_list_says_what_the_library_has(library) -> None:
+    import json
+
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    result = _invoke(root, "bib", "list", "--json")
+
+    (entry,) = json.loads(result.stdout)
+    assert entry["slug"] == "thesis" and entry["sources"] == 1
+    assert entry["bib"].endswith("references.bib")
+
+
+def test_bib_list_of_an_empty_library_says_how_to_start_one(library) -> None:
+    root = library.root
+    library.close()
+
+    result = _invoke(root, "bib", "list")
+
+    assert result.exit_code == 0
+    assert "bib init" in result.stdout
+
+
+def test_bib_add_asks_before_it_opens_the_database(library, monkeypatch) -> None:
+    """Both questions wait on a person, and the write lock must not wait with them.
+
+    DuckDB admits one writing process, so a prompt held open across the lock
+    stops the watcher, which waits 30 seconds and then fails. So the order is
+    the contract: everything that asks happens before anything that opens.
+    """
+    from sortyourpaperya import cli
+
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    order: list[str] = []
+    ask, open_library = cli._prompt, cli.Library
+    monkeypatch.setattr(cli, "_prompt", lambda *a, **k: order.append("asked") or ask(*a, **k))
+    monkeypatch.setattr(
+        cli, "Library", lambda *a, **k: order.append("opened") or open_library(*a, **k)
+    )
+    # The command reaches the library through the read seam now, which takes a
+    # read-only connection and so holds no write lock at all -- a stronger form
+    # of the same contract. Record that too, or the order comes back empty.
+    seam = cli._reading
+    monkeypatch.setattr(
+        cli, "_reading", lambda *a, **k: order.append("opened") or seam(*a, **k)
+    )
+
+    result = _invoke(root, "bib", "add", input=f"thesis\n{paper.file_id}\n")
+
+    assert result.exit_code == 0, result.output
+    assert order == ["asked", "asked", "opened"]
+
+
+def test_bib_init_link_puts_the_folder_in_the_directory_it_was_run_from(
+    library, tmp_path, monkeypatch
+) -> None:
+    """`\\addbibresource{thesis/references.bib}` from the manuscript's own directory."""
+    root = library.root
+    library.close()
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+    monkeypatch.chdir(manuscript)
+
+    result = _invoke(root, "bib", "init", "Thesis", "--link")
+
+    assert result.exit_code == 0, result.output
+    link = manuscript / "thesis"
+    assert link.is_symlink()
+    assert (link / "references.bib").is_file()
+
+
+def test_bib_add_link_reaches_the_same_folder(library, tmp_path, monkeypatch) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    manuscript = tmp_path / "manuscript"
+    manuscript.mkdir()
+    monkeypatch.chdir(manuscript)
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id, "--link")
+
+    assert result.exit_code == 0, result.output
+    assert "@misc{vaswani2017attention," in (
+        manuscript / "thesis" / "references.bib"
+    ).read_text()
+
+
+def test_a_cited_book_is_shelved_inside_the_bibliography(library) -> None:
+    """So the one link into the manuscript carries the book with it."""
+    root, paper = _cited(library, file_id="dd44ee55ff66", title="The TeXbook",
+                         authors=["Donald Knuth"], year=1984,
+                         store_name="dd44ee55ff66__Books",
+                         document_name="knuth_1984_the-texbook.pdf")
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "attr", paper.file_id, "publisher", "Addison-Wesley")
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "@book{knuth1984texbook," in (
+        root / "bibs" / "thesis" / "references.bib"
+    ).read_text()
+    shelved = root / "bibs" / "thesis" / "knuth_1984" / "knuth_1984_the-texbook.pdf"
+    assert shelved.is_symlink()
+    assert "shelved knuth_1984/" in result.stdout
+
+
+def test_a_cited_paper_is_not_shelved(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    assert "shelved" not in result.stdout
+    assert sorted(p.name for p in (root / "bibs" / "thesis").iterdir()) == [
+        "bib.toml",
+        "references.bib",
+    ]
+
+
+def test_bib_note_opens_a_note_on_the_manuscript(library) -> None:
+    root = library.root
+    library.close()
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "note", "--lib", "thesis", "--path")
+
+    assert result.exit_code == 0, result.output
+    path = Path(result.stdout.strip())
+    assert path == root / "bibs" / "thesis" / "notes.md"
+    assert path.read_text() == "# Thesis\n\n"
+
+
+def test_bib_note_on_a_source_is_named_by_its_citation_key(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    result = _invoke(root, "bib", "note", "--lib", "thesis", "--cite", "vaswani", "--path")
+
+    assert result.exit_code == 0, result.output
+    assert Path(result.stdout.strip()) == (
+        root / "bibs" / "thesis" / "notes" / "vaswani2017attention.md"
+    )
+
+
+def test_a_source_note_is_not_the_documents_own_note(library) -> None:
+    """One describes the document; the other what it does for this manuscript."""
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+
+    scoped = _invoke(root, "bib", "note", "--lib", "thesis", "--cite", "vaswani", "--path")
+    own = _invoke(root, "note", paper.file_id, "--path")
+
+    assert Path(scoped.stdout.strip()) != Path(own.stdout.strip())
+    assert "bibs" in str(Path(scoped.stdout.strip()))
+    assert "store" in str(Path(own.stdout.strip()))
+
+
+def test_a_note_on_something_the_bibliography_does_not_cite_says_so(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "bib", "note", "--lib", "thesis", "--cite", paper.file_id, "--path")
+
+    assert result.exit_code == 1
+    assert "does not cite" in result.stderr and "bib add" in result.stderr
+
+
+# ---- reading a document ------------------------------------------------------
+
+
+def _readable(library, pages: int = 3):
+    """A filed document with a real multi-page PDF behind it."""
+    from pypdf import PdfReader, PdfWriter
+
+    from sortyourpaperya.db import Paper
+
+    paper = Paper(
+        file_id="78c64b3b8ef6",
+        content_hash="sha-manual",
+        store_name="78c64b3b8ef6__Manuals",
+        document_name="acme_2024_manual.pdf",
+        title="Acme Manual",
+        year=2024,
+        tags=["Manuals"],
+    )
+    library.db.upsert(paper)
+    folder = library.document_dir(paper)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    writer = PdfWriter()
+    for number in range(1, pages + 1):
+        writer.append(
+            PdfReader(str(write_pdf(folder / f"src{number}.pdf", f"page {number} here")))
+        )
+    writer.write(str(folder / paper.document_name))
+    for number in range(1, pages + 1):
+        (folder / f"src{number}.pdf").unlink()
+
+    root = library.root
+    library.close()
+    return root, paper
+
+
+def test_read_prints_the_document_and_nothing_else_on_stdout(library) -> None:
+    """So `sortyourpaperya read <id> | grep` and `$(...)` both work."""
+    root, paper = _readable(library)
+
+    result = _invoke(root, "read", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "page 1 here" in result.stdout and "page 3 here" in result.stdout
+    assert "pages 1-3 of 3" in result.stderr
+    assert "pages 1-3 of 3" not in result.stdout
+
+
+def test_read_takes_a_page_range(library) -> None:
+    root, _ = _readable(library)
+
+    result = _invoke(root, "read", "acme", "--pages", "2-3")
+
+    assert result.exit_code == 0, result.output
+    assert "page 1 here" not in result.stdout
+    assert "page 2 here" in result.stdout and "page 3 here" in result.stdout
+    assert "pages 2-3 of 3" in result.stderr
+
+
+def test_an_open_ended_range_is_the_rest_of_it(library) -> None:
+    root, _ = _readable(library)
+
+    result = _invoke(root, "read", "acme", "--pages", "2-")
+
+    assert result.exit_code == 0, result.output
+    assert "page 3 here" in result.stdout and "page 1 here" not in result.stdout
+
+
+def test_a_range_that_names_no_pages_is_a_usage_error(library) -> None:
+    """Naming the option, not something surfacing from inside pypdf."""
+    root, _ = _readable(library)
+
+    for bad in ("two", "5-2", "0"):
+        result = _invoke(root, "read", "acme", "--pages", bad)
+        assert result.exit_code == 2, bad
+        assert "--pages" in result.stderr
+
+
+def test_reading_a_scan_nothing_has_read_says_what_would(library) -> None:
+    from sortyourpaperya.db import Paper
+
+    paper = Paper(
+        file_id="aa11bb22cc33",
+        content_hash="sha-scan",
+        store_name="aa11bb22cc33__Scans",
+        document_name="scan.pdf",
+        title="A Scanned Report",
+        tags=["Scans"],
+    )
+    library.db.upsert(paper)
+    folder = library.document_dir(paper)
+    folder.mkdir(parents=True, exist_ok=True)
+    write_scanned_pdf(folder / paper.document_name)
+    root = library.root
+    library.close()
+
+    result = _invoke(root, "read", paper.file_id)
+
+    assert result.exit_code == 1
+    assert "no text layer" in result.stderr and "ingest" in result.stderr
+
+
+def test_a_scan_the_model_has_read_prints_that_reading_and_says_so(library) -> None:
+    """It is a model's reading of a picture, not the document's own words."""
+    from sortyourpaperya.db import ModelAnswer, Paper
+
+    paper = Paper(
+        file_id="aa11bb22cc33",
+        content_hash="sha-scan",
+        store_name="aa11bb22cc33__Scans",
+        document_name="scan.pdf",
+        title="A Scanned Report",
+        pages_read=2,
+        tags=["Scans"],
+    )
+    library.db.upsert(paper)
+    folder = library.document_dir(paper)
+    folder.mkdir(parents=True, exist_ok=True)
+    write_scanned_pdf(folder / paper.document_name)
+    library.db.remember_model_answers(
+        [ModelAnswer(content_hash="sha-scan", page_text="A report about scanned things.")]
+    )
+    root = library.root
+    library.close()
+
+    result = _invoke(root, "read", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "A report about scanned things." in result.stdout
+    assert "no text layer; a model's reading of its first 2 page(s)" in result.stderr
+
+
+def test_reading_a_document_whose_file_is_gone_says_so(library) -> None:
+    root, paper = _readable(library)
+    (root / "store" / paper.store_name / paper.document_name).unlink()
+
+    result = _invoke(root, "read", paper.file_id)
+
+    assert result.exit_code == 1
+    assert "missing from the store" in result.stderr
+
+
+# ---- what --input may name ---------------------------------------------------
+
+
+def test_a_non_pdf_input_is_refused_rather_than_filing_nothing(tmp_path) -> None:
+    """"filed 0 document(s)" reads as "nothing new here", not as a typo."""
+    from typer.testing import CliRunner
+
+    from sortyourpaperya.cli import app
+
+    notes = tmp_path / "notes.txt"
+    notes.write_text("not a pdf", encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["ingest", "--input", str(notes)])
+
+    assert result.exit_code == 2
+    assert "--input" in result.stderr and ".txt" in result.stderr
+
+
+def test_an_input_that_is_not_there_is_refused(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from sortyourpaperya.cli import app
+
+    result = CliRunner().invoke(app, ["ingest", "--input", str(tmp_path / "gone")])
+
+    assert result.exit_code == 2
+    assert "not a folder or a PDF" in result.stderr
+
+
+def test_a_pdf_and_a_folder_both_pass_the_check(tmp_path) -> None:
+    """The check refuses; deciding there is nothing to file is ingest's job."""
+    from sortyourpaperya.cli import _check_input
+
+    _check_input(tmp_path)
+    _check_input(write_pdf(tmp_path / "a.pdf", "attention"))
+    _check_input(None)
+
+
+# ---- which bibliographies cite a document ------------------------------------
+
+
+def _twice_cited(library):
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "PhD Thesis")
+    _invoke(root, "bib", "init", "Review 2026")
+    for slug in ("phd-thesis", "review-2026"):
+        _invoke(root, "bib", "add", "--lib", slug, "--cite", paper.file_id)
+    return root, paper
+
+
+def test_cited_names_every_bibliography_and_the_key_it_uses(library) -> None:
+    root, paper = _twice_cited(library)
+
+    result = _invoke(root, "cited", paper.file_id)
+
+    assert result.exit_code == 0, result.output
+    assert "phd-thesis" in result.stdout and "review-2026" in result.stdout
+    assert result.stdout.count("vaswani2017attention") == 2
+
+
+def test_cited_json_carries_what_a_caller_would_use(library) -> None:
+    import json
+
+    root, paper = _twice_cited(library)
+
+    result = _invoke(root, "cited", paper.file_id, "--json")
+
+    records = json.loads(result.stdout)
+    assert [r["bib"] for r in records] == ["phd-thesis", "review-2026"]
+    assert all(r["key"] == "vaswani2017attention" for r in records)
+
+
+def test_a_document_nothing_cites_says_so(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+
+    result = _invoke(root, "cited", paper.file_id)
+
+    assert result.exit_code == 0
+    assert "no bibliography cites" in result.stdout
+
+
+def test_find_json_carries_what_cites_each_document(library) -> None:
+    import json
+
+    root, _ = _twice_cited(library)
+
+    result = _invoke(root, "find", "attention", "--json")
+
+    (record,) = json.loads(result.stdout)
+    assert [c["bib"] for c in record["cited_by"]] == ["phd-thesis", "review-2026"]
+
+
+def test_removing_a_cited_document_says_what_cites_it_first(library) -> None:
+    """The entry survives and keeps working, but stops leading anywhere."""
+    root, paper = _twice_cited(library)
+
+    result = _invoke(root, "remove", paper.file_id, input="n\n")
+
+    assert "cited by phd-thesis as vaswani2017attention" in result.stdout
+    assert "cited by review-2026 as vaswani2017attention" in result.stdout
+    assert result.exit_code == 1, "aborting is not a delete"
+    assert (root / "store" / paper.store_name).is_dir()
+
+
+def test_a_page_of_records_reads_the_bibliographies_once(library, monkeypatch) -> None:
+    """Not once per row: `list --json` describes the whole library."""
+    from sortyourpaperya import cli
+
+    root, _ = _twice_cited(library)
+    for number in range(3):
+        _invoke(root, "bib", "init", f"Other {number}")
+
+    reads = []
+    original = cli.bibs.citations
+    monkeypatch.setattr(
+        cli.bibs, "citations", lambda root: reads.append(root) or original(root)
+    )
+
+    result = _invoke(root, "list", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert len(reads) == 1

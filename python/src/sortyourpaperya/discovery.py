@@ -28,17 +28,31 @@ class PdfCandidate:
 
 
 def discover_pdfs(root: Path, recursive: bool = False) -> list[PdfCandidate]:
-    """List the PDFs under ``root``, sorted by path so batching is stable.
+    """List the PDFs ``root`` is offering, sorted by path so batching is stable.
+
+    ``root`` is usually a folder. A single PDF is accepted as the list of one it
+    is, so filing one document and filing the folder it sits in are the same
+    request at different scope, and neither needs its own pipeline.
 
     A watched folder changes while it is being read: a download completes, a
     file is renamed, something is deleted between listing and measuring. A file
     that goes missing mid-scan is skipped rather than raised — the scan runs on
     every pass of a long-lived watcher, so an exception here would take the
-    whole service down over an ordinary event.
+    whole service down over an ordinary event. Which is also why a ``root`` that
+    is neither is empty rather than an error: by the time a scan sees it, the
+    folder has been deleted out from under a running watcher. A path typed by
+    hand is checked where it is typed, in `cli`, and refused there.
     """
+    if root.is_file():
+        return _candidates([root])
+
     pattern = "**/*" if recursive else "*"
+    return _candidates(sorted(root.glob(pattern)))
+
+
+def _candidates(paths: list[Path]) -> list[PdfCandidate]:
     candidates: list[PdfCandidate] = []
-    for path in sorted(root.glob(pattern)):
+    for path in paths:
         if path.suffix.lower() != ".pdf":
             continue
         try:

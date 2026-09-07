@@ -29,9 +29,11 @@ are categorized on their own terms.
 ```bash
 ./install.sh                              # macOS or Linux; installs `sortyourpaperya`
 
-sortyourpaperya ingest --input ./inbox               # preview: nothing is written
-sortyourpaperya ingest --input ./inbox --mode copy   # copy in, leave the source alone
-sortyourpaperya watch  --input ./inbox --mode copy   # keep doing it as documents arrive
+sypy login                                           # store your API key in the keychain
+sypy doctor                                          # check the watcher and the model
+sypy ingest --input ./inbox                          # preview: nothing is written
+sypy ingest --input ./inbox --mode copy              # copy in, leave the source alone
+sypy watch  --input ./inbox --mode copy              # keep doing it as documents arrive
 ```
 
 Everything else — the store layout, the registry of watched folders, running it

@@ -2,7 +2,7 @@
 #
 # Install sortyourpaperya on macOS or Linux.
 #
-#   ./install.sh                 install `sortyourpaperya` and put it on PATH
+#   ./install.sh                 install `sortyourpaperya` (and `sypy`) on PATH
 #   ./install.sh --service       ...and run the watcher in the background
 #   ./install.sh --check         check prerequisites and stop
 #   ./install.sh --uninstall     take it back off
@@ -45,11 +45,11 @@ usage: ./install.sh [--service] [--check] [--uninstall]
 
   --service     also install the background watcher (launchd or systemd --user)
   --check       report what is missing and stop, changing nothing
-  --uninstall   remove the \`sortyourpaperya\` and skill links, and the service if installed
+  --uninstall   remove the \`sortyourpaperya\`/\`sypy\` and skill links, and the service if installed
   -h, --help    this
 
   SORTYOURPAPERYA_VENV_DIR    where the virtualenv goes    (default $PACKAGE_DIR/.venv)
-  SORTYOURPAPERYA_BIN_DIR     where \`sortyourpaperya\` is linked       (default \$HOME/.local/bin)
+  SORTYOURPAPERYA_BIN_DIR     where the commands are linked (default \$HOME/.local/bin)
   SORTYOURPAPERYA_SKILLS_DIR  where the agent skill goes   (default \$HOME/.claude/skills)
 USAGE
   exit 2
@@ -229,11 +229,12 @@ fi
 
 step "Done"
 if on_path; then
-  printf '  Run: %ssortyourpaperya --help%s\n' "$BOLD" "$RESET"
+  printf '  Run: %ssypy --help%s  (or %ssortyourpaperya --help%s — same command)\n' \
+    "$BOLD" "$RESET" "$BOLD" "$RESET"
 else
   printf '  %s is not on your PATH. Add it:\n\n' "$BIN_DIR"
   printf "    echo '%s' >> %s\n\n" "$(path_line)" "$(shell_rc)"
-  printf '  Then open a new shell, or run %s%s/sortyourpaperya --help%s now.\n' \
+  printf '  Then open a new shell, or run %s%s/sypy --help%s now.\n' \
     "$BOLD" "$BIN_DIR" "$RESET"
 fi
 

@@ -5,9 +5,11 @@ description = "The sortyourpaperya ingest pipeline and folder watcher."
 requires-python = ">=3.11"
 dependencies = [
   "duckdb>=1.1.0",
+  "keyring>=25.0.0",
   "openai>=1.60.0",
   "pypdf>=5.1.0",
   "python-dotenv>=1.0.1",
+  "tomli-w>=1.0.0",
   "typer>=0.16.0",
   "watchdog>=6.0.0",
 ]
@@ -20,7 +22,11 @@ dev = [
 ]
 
 [project.scripts]
+# Two names, one entry point. The long one matches the package, so a machine
+# that installed this from a wheel gets the name it expects; `sypy` is the one
+# anyone actually types more than once.
 sortyourpaperya = "sortyourpaperya.cli:main"
+sypy = "sortyourpaperya.cli:main"
 
 [build-system]
 requires = ["hatchling"]

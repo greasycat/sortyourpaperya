@@ -57,7 +57,7 @@ from .extract import ExtractionError, PaperText, extract_paper_text
 from .library import FilingMode, Library, LibraryError, PlannedFiling, RescanReport
 from .llm import KeywordPair, LlmClient, LlmError
 from .render import RenderError, render_pages
-from .naming import link_name, new_paper_id, split_category, store_name
+from .naming import link_name, new_id, split_category, store_name
 
 log = logging.getLogger(__name__)
 
@@ -257,7 +257,7 @@ def _describe_paper(
     """Build the database row for one labelled document. Pure computation."""
     tags = split_category(pair.preliminary_category)
     paper = Paper(
-        file_id=new_paper_id(),
+        file_id=new_id(),
         content_hash=content_hash,
         store_name="",  # set below, once the id and tags are both known
         original_name=paper_text.path.name,

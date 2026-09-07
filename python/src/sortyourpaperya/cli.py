@@ -12,8 +12,16 @@ from typing import Sequence
 
 import typer
 
+from . import bib as bibs
+from . import notes
+from .bib import BibError, Bibliography
 from .budget import Budget
 from .config import (
+    becomes_the_spender,
+    KEYRING_SERVICE,
+    forget_api_key,
+    key_from_keychain,
+    store_api_key,
     MAX_STEERING_CATEGORIES,
     DEFAULT_LABEL_CACHE_DAYS,
     DEFAULT_LLM_MAX_RETRIES,
@@ -24,9 +32,12 @@ from .config import (
     resolve_api_key,
     resolve_settings,
 )
+from . import extract
 from .db import SORTS, Paper
+from .extract import ExtractionError
 from .ingest import ingest_folder
 import os
+import contextlib
 import shutil
 import subprocess
 
@@ -108,7 +119,9 @@ def _configure(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
 
 @app.command()
 def ingest(
-    input_dir: Path = typer.Option(None, "--input", "-i", help="Folder of PDFs."),
+    input_dir: Path = typer.Option(
+        None, "--input", "-i", help="Folder of PDFs, or one PDF."
+    ),
     library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
     recursive: bool = typer.Option(None, "--recursive", "-r"),
     page_cutoff: int = typer.Option(None, "--page-cutoff", "-p"),
@@ -120,33 +133,119 @@ def ingest(
         help="preview (default), copy to leave the source in place, or move.",
     ),
 ) -> None:
-    """Read every not-yet-known document and file it into the library."""
+    """Read every not-yet-known document and file it into the library.
+
+    `--input` takes a folder or a single PDF, so one document can be filed
+    without putting it in a folder of its own first, and without the rest of the
+    folder it happens to sit in coming along with it.
+    """
+    _check_input(input_dir)
+    # The watcher owns the stored key and the write connection, so when one is
+    # running the filing is its job. That is also what makes `sypy login` mean
+    # what it says: the key it stores is spent here, by the service, whoever
+    # typed the command.
+    from . import client as _client
+
+    root = _resolved_library(library_dir)
+    if root is not None and _client.serving(root):
+        report = _ingest_via_watcher(_client, root, input_dir, mode, model)
+        _report_ingest(report, mode)
+        return
+
     settings, client = _build(
         input_dir, library_dir, recursive, page_cutoff, batch_size, model
     )
     with Library(settings.output_dir) as library:
         report = asyncio.run(ingest_folder(settings, client, library, mode=mode))
-
-        verb = "filed" if mode.writes else "would file"
-        typer.echo(
-            f"{verb} {report.processed} document(s); "
-            f"{report.skipped_already_known} already known; "
-            f"{len(report.skipped_oversized)} oversized; {len(report.failed)} failed"
-        )
-        if report.rescan and report.rescan.changed:
-            typer.echo(
-                f"  ({len(report.rescan.changed)} stored file(s) changed on disk; "
-                "hashes refreshed)"
-            )
-        for filing in report.filed or report.planned:
-            typer.echo(f"  {filing.describe()}")
-        for path, reason in report.failed:
-            typer.echo(f"  ! {path.name}: {reason}", err=True)
-        if not mode.writes and report.planned:
-            typer.echo("\nnothing was written; re-run with --mode copy or --mode move")
+        _report_ingest(report, mode)
 
     if report.failed:
         raise typer.Exit(code=1)
+
+
+def _ingest_via_watcher(client_mod, root: Path, input_dir: Path | None, mode, model):
+    """Have the watcher file the folder, printing what it files as it goes.
+
+    The pass runs there, so its per-document lines arrive as events rather than
+    all at once when it finishes -- a folder of fifty takes a while, and silence
+    for the whole of it reads as a hang.
+    """
+    if input_dir is None:
+        # Without one, `ingest` files the current directory. That was a local
+        # mistake when the key had to be in this shell; handing an unnamed
+        # directory to the watcher makes it a spend on the service's key from
+        # wherever the command happened to be typed. Say what to file.
+        raise typer.BadParameter(
+            "name what to file with --input when a watcher is running; "
+            "it is the watcher that spends, so the folder is not assumed"
+        )
+    _check_input(input_dir)
+    from . import protocol
+
+    # Decoded like every other result that crosses the socket. Without this the
+    # report arrives as the dict `protocol.dump` made of it, and the reporting
+    # below dies on `.processed` -- after the pass has already run and been paid
+    # for, which is the worst possible moment to fall over.
+    return protocol.load(client_mod.call(
+        root,
+        "ingest",
+        {
+            "input_dir": str(input_dir),
+            "mode": mode.value,
+            "model": model,
+        },
+        on_event=lambda frame: typer.echo(
+            f"  {frame.get('event')}: {frame.get('input', '')}".rstrip(": ")
+        ),
+    ))
+
+
+def _report_ingest(report, mode) -> None:
+    """What a pass did, for a person reading it."""
+    verb = "filed" if mode.writes else "would file"
+    typer.echo(
+        f"{verb} {report.processed} document(s); "
+        f"{report.skipped_already_known} already known; "
+        f"{len(report.skipped_oversized)} oversized; {len(report.failed)} failed"
+    )
+    if report.rescan and report.rescan.changed:
+        typer.echo(
+            f"  ({len(report.rescan.changed)} stored file(s) changed on disk; "
+            "hashes refreshed)"
+        )
+    for filing in report.filed or report.planned:
+        typer.echo(f"  {filing.describe()}")
+    for path, reason in report.failed:
+        typer.echo(f"  ! {path.name}: {reason}", err=True)
+    if not mode.writes and report.planned:
+        typer.echo("\nnothing was written; re-run with --mode copy or --mode move")
+
+
+def _check_input(path: Path | None) -> None:
+    """Refuse an `--input` that offers no documents, saying which way it is wrong.
+
+    `discover_pdfs` answers a path that is neither a folder nor a PDF with an
+    empty list, deliberately: it runs on every pass of a long-lived watcher, and
+    a folder deleted underneath one must not take the service down. But the same
+    silence answers a typo with "filed 0 document(s)", which reads as "nothing
+    new here" — so a path typed by hand is checked here, where it was typed.
+    """
+    if path is None:
+        return
+    expanded = path.expanduser()
+    if expanded.is_dir():
+        return
+    if expanded.is_file():
+        if expanded.suffix.lower() == ".pdf":
+            return
+        typer.echo(
+            f"error: --input {path} is a {expanded.suffix or 'suffixless'} file; "
+            "this files PDFs. Name the folder to file what is in it.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    typer.echo(f"error: --input {path} is not a folder or a PDF", err=True)
+    raise typer.Exit(code=2)
 
 
 @app.command()
@@ -177,6 +276,11 @@ def watch(
         typer.echo(f"error: no watch named {name!r}", err=True)
         raise typer.Exit(code=2)
 
+    # This process is the service, so it is the one `sypy login` stored a key
+    # for -- declared before the client is built, which is where the key is
+    # resolved. A command run by hand never reaches this line, which is the
+    # whole point: the stored key is the watcher's to spend.
+    becomes_the_spender()
     settings, client = _build(
         input_dir, library_dir, recursive, page_cutoff, batch_size, model
     )
@@ -201,7 +305,7 @@ def tree(
 ) -> None:
     """Rebuild the symlink tree from the database."""
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         linked = library.rebuild_tree()
         typer.echo(f"linked {linked} document(s) under {library.tree_dir}")
         for paper in library.missing_files():
@@ -340,7 +444,8 @@ def retag(
 
     With a category, it is applied. Without one the model is asked where the
     document belongs and nothing is written until you accept — which is the way
-    back from a label that steering got wrong.
+    back from a label that steering got wrong. Each round you may say what the
+    model is missing, and it answers again knowing it.
     """
     if category is None:
         _retag_by_asking(file_id, library_dir, model)
@@ -352,7 +457,7 @@ def retag(
         typer.echo(f"error: {category!r} has no usable tags", err=True)
         raise typer.Exit(code=2)
 
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         _apply_retag(library, _resolve(library, file_id).file_id, tags)
 
 
@@ -379,7 +484,7 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
     """
     settings, client = _build(None, library_dir, None, None, None, model)
 
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         paper = _resolve(library, file_id)
         store_path = library.store_path(paper)
         steering = library.existing_categories(MAX_STEERING_CATEGORIES)
@@ -390,6 +495,11 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
         typer.echo(f"  now:        {' / '.join(paper.tags) or '-'}")
 
         rejected: list[str] = []
+        # What the person last said about this document. The latest replaces
+        # the one before it rather than piling up: someone correcting their own
+        # steer — "no, the hardware side" — means the newer sentence, and two
+        # contradictory instructions in one prompt are worth less than either.
+        guidance = ""
         while True:
             try:
                 suggestion = asyncio.run(
@@ -400,6 +510,7 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
                         page_cutoff=settings.page_cutoff,
                         existing_categories=steering,
                         rejected=rejected,
+                        guidance=guidance,
                     )
                 )
             except LlmError as err:
@@ -421,10 +532,14 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
             )
             if suggestion.keywords:
                 typer.echo(f"  keywords:   {', '.join(suggestion.keywords)}")
+            if guidance:
+                # Named alongside the answer it produced, so a suggestion that
+                # ignored what you said is visibly that rather than a mystery.
+                typer.echo(f"  asked for:  {guidance}")
 
-            choice = _ask_what_to_do()
+            choice, direction = _ask_what_to_do()
             if choice == "accept":
-                with Library(settings.output_dir) as writable:
+                with _writing(settings.output_dir) as writable:
                     _apply_retag(
                         writable, paper.file_id, tags, suggestion.keywords or None
                     )
@@ -432,32 +547,162 @@ def _retag_by_asking(file_id: str, library_dir: Path | None, model: str | None) 
             if choice == "cancel":
                 typer.echo("nothing changed")
                 return
+            if direction:
+                guidance = direction
             rejected.append(suggestion.category)
 
 
-def _ask_what_to_do() -> str:
-    """Accept, regenerate, or cancel.
+def _ask_what_to_do() -> tuple[str, str]:
+    """Accept, say what the model is missing, ask again, or cancel.
 
-    An end of input is a cancel rather than a crash, so running this with no one
-    at the keyboard — from cron, or with stdin closed — stops cleanly instead of
-    failing with a traceback.
+    Returns the choice and, when one was given, the direction to ask under.
+    Steering is read here rather than by the caller because an empty answer is
+    not a decision: the menu comes back, and no request has been spent.
     """
     while True:
-        try:
-            answer = typer.prompt("[a]ccept, [r]egenerate, [c]ancel", default="a")
-        except (typer.Abort, EOFError):
-            # Typer vendors click, so its re-export is the one public name for
-            # the exception a closed stdin raises.
-            typer.echo("\ncancelled; nothing changed")
-            raise typer.Exit(code=0) from None
+        answer = _prompt("[a]ccept, [s]teer, [r]egenerate, [c]ancel", default="a")
         first = answer.strip()[:1].lower()
         if first == "a":
-            return "accept"
+            return "accept", ""
         if first == "r":
-            return "regenerate"
+            return "regenerate", ""
         if first == "c":
-            return "cancel"
-        typer.echo("  please answer a, r, or c", err=True)
+            return "cancel", ""
+        if first == "s":
+            # A steer is a re-ask that carries a sentence, so the caller has
+            # nothing extra to handle: it regenerates either way.
+            direction = _prompt(
+                "  what is it about, or where should it go?", default=""
+            ).strip()
+            if direction:
+                return "regenerate", direction
+            continue
+        typer.echo("  please answer a, s, r, or c", err=True)
+
+
+def _prompt(text: str, default: str = "") -> str:
+    """Ask a question, treating an end of input as a cancel rather than a crash.
+
+    Running this with no one at the keyboard — from cron, or with stdin closed
+    — stops cleanly instead of failing with a traceback.
+    """
+    try:
+        return typer.prompt(text, default=default)
+    except (typer.Abort, EOFError):
+        # Typer vendors click, so its re-export is the one public name for
+        # the exception a closed stdin raises.
+        typer.echo("\ncancelled; nothing changed")
+        raise typer.Exit(code=0) from None
+
+
+@app.command("read")
+def read_document(
+    file_id: str = typer.Argument(..., help="Document id, or words from its title, authors, or keywords."),
+    pages: str = typer.Option(
+        None, "--pages", help="Which pages, e.g. '3', '4-9', or '10-'. Default: all of them."
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Print a filed document's text.
+
+    The text goes to stdout and nothing else does, so `sortyourpaperya read <id>
+    | grep` and `$(sortyourpaperya read <id>)` both work. What was read — which
+    pages, out of how many — goes to stderr, because a document is long and a
+    reader who got pages 1 to 5 of 300 should not have to notice on their own.
+
+    A `--pages` range is how you read a book without reading a book. It is
+    clipped to the document rather than refused, so `--pages 10-` is the rest of
+    it however long it turns out to be.
+
+    Layout is kept as the page has it. That is the difference between this and
+    what ingest reads: a request pays by the character and wants one line, where
+    a reader wants the lines the document has.
+
+    A scanned document has no text to extract. Where the model has already read
+    its pages — which ingest pays for once and banks — that reading is printed
+    instead, and stderr says so: it is the document's own words in the one case
+    and a model's reading of a picture in the other, and nothing downstream can
+    tell them apart afterwards.
+    """
+    first, last = _pages(pages)
+    settings = _settings(None, library_dir)
+    with _reading(settings.output_dir) as library:
+        paper = _resolve(library, file_id)
+        path = library.store_path(paper)
+        if not path.is_file():
+            typer.echo(
+                f"error: {paper.store_name} is missing from the store", err=True
+            )
+            raise typer.Exit(code=1)
+        try:
+            document = extract.read_document(path, first, last)
+        except ExtractionError as err:
+            typer.echo(f"error: {err}", err=True)
+            raise typer.Exit(code=1) from err
+
+        if document.has_text_layer:
+            text = document.text
+            notice = f"{_read_range(document)} of {document.total_pages}"
+        else:
+            banked = library.db.model_answers(
+                [paper.content_hash], max_age_ms=None
+            ).get(paper.content_hash)
+            text = (banked.page_text or "").strip() if banked else ""
+            # Deliberately not a page range. The banked text is one answer
+            # covering the pages ingest looked at, not a page each, so there is
+            # no page 3 of it to hand back and claiming otherwise would invite
+            # a quote attributed to a page nobody read.
+            covered = paper.pages_read or 0
+            notice = (
+                "no text layer; a model's reading of its first "
+                f"{covered} page(s)" if covered else
+                "no text layer; a model's reading of its pages"
+            )
+            if pages:
+                typer.echo(
+                    f"  --pages {pages} does not apply to a model's reading", err=True
+                )
+
+    if not text:
+        typer.echo(
+            f"error: {paper.file_id} has no text layer, and nothing has read its "
+            "pages. `sortyourpaperya ingest` reads a scan, and costs a request.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(text)
+    typer.echo(notice, err=True)
+
+
+def _read_range(document: "extract.DocumentText") -> str:
+    last = document.first_page + len(document.pages) - 1
+    if len(document.pages) == 1:
+        return f"page {document.first_page}"
+    return f"pages {document.first_page}-{last}"
+
+
+def _pages(text: str | None) -> tuple[int, int | None]:
+    """A `--pages` range as first and last, where last may be open.
+
+    Refused at the CLI, where the input arrives, so a typo is a usage error
+    naming the option rather than something surfacing from inside pypdf.
+    """
+    if not text:
+        return 1, None
+    first, dash, last = text.strip().partition("-")
+    try:
+        start = int(first)
+        end = None if (dash and not last.strip()) else int(last or first)
+    except ValueError:
+        typer.echo(
+            f"error: --pages takes '3', '4-9', or '10-', not {text!r}", err=True
+        )
+        raise typer.Exit(code=2) from None
+    if start < 1 or (end is not None and end < start):
+        typer.echo(f"error: --pages {text!r} names no pages", err=True)
+        raise typer.Exit(code=2)
+    return start, end
 
 
 @app.command()
@@ -490,7 +735,7 @@ def note(
     drive would be left holding a terminal open forever.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         paper = _resolve(library, file_id)
         if not library.document_dir(paper).is_dir():
             typer.echo(f"error: {paper.store_name} is missing from the store", err=True)
@@ -515,22 +760,356 @@ def note(
                 raise typer.Exit(code=1)
             path = existing[0] if existing else library.note_path(paper)
 
-        if not path.exists():
-            # An empty JSON note has to parse, or it is broken for the only
-            # thing JSON is kept for.
-            if path.suffix.lower() == ".json":
-                path.write_text("{}\n", encoding="utf-8")
-            else:
-                title = paper.title or paper.original_name or paper.store_name
-                path.write_text(f"# {title}\n\n", encoding="utf-8")
+        notes.create(path, _label(paper))
 
+    _open_or_print(path, path_only)
+
+
+bib_app = typer.Typer(
+    help="Bibliographies: what you cite, and the .bib LaTeX reads.",
+    no_args_is_help=True,
+)
+app.add_typer(bib_app, name="bib")
+
+
+@bib_app.command("init")
+def bib_init(
+    name: str = typer.Argument(..., help="What the bibliography is called, e.g. 'PhD Thesis'."),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    link: bool = typer.Option(
+        False, "--link", help="Also link the bibliography's folder into this directory."
+    ),
+) -> None:
+    """Start a new bibliography under the library's `bibs/` folder.
+
+    A library holds as many as its owner writes papers: one per manuscript,
+    keeping its own citation keys, so a key disambiguated in one does not
+    change under another's feet. The folder is named by the slug of `name`, and its
+    `bib.toml` records the name as given.
+    """
+    settings = _settings(None, library_dir)
+    try:
+        bibliography = bibs.create(settings.output_dir, name)
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    typer.echo(f"{bibliography.slug}  {bibliography.id}  {bibliography.name}")
+    typer.echo(f"  record  {bibliography.record_path}")
+    typer.echo(f"  bib     {bibliography.bib_path}")
+    if link:
+        _link_here(bibliography)
+
+
+@bib_app.command("list")
+def bib_list(
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print records instead of a table, for a program to read."
+    ),
+) -> None:
+    """Every bibliography in the library, with its slug, id, and size."""
+    settings = _settings(None, library_dir)
+    found = bibs.all_bibs(settings.output_dir)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                [
+                    {
+                        "id": entry.id,
+                        "slug": entry.slug,
+                        "name": entry.name,
+                        "sources": len(entry.sources),
+                        "path": str(entry.path),
+                        "bib": str(entry.bib_path),
+                        "created_at": _timestamp(entry.created_at_ms),
+                    }
+                    for entry in found
+                ],
+                indent=2,
+            )
+        )
+        return
+    if not found:
+        typer.echo("no bibliographies yet; `sortyourpaperya bib init <name>` starts one")
+        return
+    for entry in found:
+        typer.echo(
+            f"{entry.slug:<24}  {entry.id}  {len(entry.sources):>4} source(s)  {entry.name}"
+        )
+
+
+@bib_app.command("add")
+def bib_add(
+    lib: str = typer.Option(
+        None, "--lib", help="Which bibliography, by slug or id. Asked for if left out."
+    ),
+    cite: str = typer.Option(
+        None,
+        "--cite",
+        help="The document to cite: its id, or words from it. Asked for if left out.",
+    ),
+    entry_type: str = typer.Option(
+        None, "--type", help="BibTeX entry type. Worked out from the fields if left out."
+    ),
+    key: str = typer.Option(
+        None, "--key", help="Citation key. Built from author, year, and title if left out."
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    link: bool = typer.Option(
+        False, "--link", help="Also link the bibliography's folder into this directory."
+    ),
+) -> None:
+    """Cite one of the library's documents in one of its bibliographies.
+
+    Either half may be left off and is asked for: which bibliography, and which
+    document. The document is named the way every other command names one — an
+    id, or words from its title, authors, or keywords.
+
+    Title, authors, and year come from the library; a DOI, a journal, a page
+    range, and the rest come from the document's attributes, which is where
+    `sortyourpaperya attr` puts what the model was never asked for. What the
+    library does not know is added by editing `bib.toml` and running
+    `sortyourpaperya bib build`.
+
+    A cited book is also linked into the bibliography, under a folder named for
+    its author and year. A book is what you write alongside — you go back to
+    it, and to a chapter at a time — where a paper is read once and cited, so
+    it is the one worth having at hand rather than in the store.
+
+    `--link` puts a link to the whole bibliography folder in the directory this
+    was run from, which is how a manuscript reaches the `.bib`, the notes, and
+    those books through one name.
+    """
+    settings = _settings(None, library_dir)
+
+    # Both questions are asked before the database is opened. They wait on a
+    # person, and holding the write lock across that would stop the watcher,
+    # which waits 30 seconds and then fails.
+    bibliography = _pick_bib(settings.output_dir, lib)
+    needle = cite or _prompt("which document? (id, or words from it)")
+
+    with _reading(settings.output_dir) as library:
+        paper = _resolve(library, needle)
+
+        already = bibliography.source_for(paper.file_id)
+        if already is not None:
+            # Not an error: the document is cited, which is what was asked for.
+            typer.echo(
+                f"{paper.file_id} is already in {bibliography.slug} as {already.key}"
+            )
+            return
+
+        source = bibs.source_from_paper(
+            paper,
+            library.db.attributes(paper.file_id),
+            entry_type=entry_type,
+            key=key,
+        )
+        document_dir = library.document_dir(paper)
+
+    written = bibliography.add(source)
+    try:
+        shelved = (
+            bibs.shelve(bibliography, written, document_dir, paper.document_name)
+            if written.entry_type == bibs.SHELVED_TYPE
+            else None
+        )
+        bibliography.save()
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    typer.echo(f"{written.key}  @{written.entry_type}  {_label(paper)}")
+    if key and written.key != key:
+        typer.echo(f"  {key!r} was taken; cited as {written.key}", err=True)
+    typer.echo(f"  {bibliography.bib_path}")
+    if shelved is not None:
+        typer.echo(f"  shelved {shelved.parent.name}/{shelved.name}")
+    if link:
+        _link_here(bibliography)
+
+
+@bib_app.command("build")
+def bib_build(
+    lib: str = typer.Option(
+        None, "--lib", help="Which bibliography, by slug or id. Asked for if left out."
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Regenerate a bibliography's `.bib` from its `bib.toml`.
+
+    The TOML is the record and the `.bib` is a projection of it, so this is what
+    you run after editing the TOML by hand — to correct a title, to add a
+    journal the library never knew. Nothing in the `.bib` survives it.
+    """
+    settings = _settings(None, library_dir)
+    bibliography = _pick_bib(settings.output_dir, lib)
+    try:
+        bibliography.save()
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+    typer.echo(
+        f"wrote {len(bibliography.sources)} entr"
+        f"{'y' if len(bibliography.sources) == 1 else 'ies'} to {bibliography.bib_path}"
+    )
+
+
+@bib_app.command("note")
+def bib_note(
+    name: str = typer.Argument(
+        None,
+        help="Which note. A bare word is markdown, so `outline` means `outline.md`.",
+    ),
+    lib: str = typer.Option(
+        None, "--lib", help="Which bibliography, by slug or id. Asked for if left out."
+    ),
+    cite: str = typer.Option(
+        None,
+        "--cite",
+        help="Take notes on one cited source instead of on the manuscript.",
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    path_only: bool = typer.Option(
+        False, "--path", help="Print where the note is instead of opening it."
+    ),
+) -> None:
+    """Open a bibliography's notes, creating them if they do not exist yet.
+
+    Without `--cite`, a note about the manuscript: an outline, an argument, a
+    list of what still has to be cited. It sits beside the record, so it is
+    reached through the same `--link` and copied by the same backup.
+
+    With `--cite`, a note about one thing the manuscript cites —
+    `notes/<key>.md`, named by the citation key. That is deliberately not the
+    document's own notes, which describe the document and are shared by every
+    bibliography citing it: this is what the document does for *this*
+    manuscript, and the two do not belong in one file.
+
+    `--path` prints the file and stops, the way `sortyourpaperya note` does.
+    """
+    settings = _settings(None, library_dir)
+    bibliography = _pick_bib(settings.output_dir, lib)
+
+    try:
+        if cite is None:
+            path = _one_note(
+                bibliography.notes(), name, bibliography.note_path, "the manuscript"
+            )
+            heading = bibliography.name
+        else:
+            source = _cited_source(bibliography, settings.output_dir, cite)
+            path = _one_note(
+                bibliography.source_notes(source),
+                name,
+                lambda given: bibliography.source_note_path(source, given),
+                source.key,
+            )
+            heading = f"{source.key} in {bibliography.name}"
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    notes.create(path, heading)
+    _open_or_print(path, path_only)
+
+
+def _one_note(existing: list[Path], name: str | None, at, subject: str) -> Path:
+    """The note a command should open: the named one, or the only one there is.
+
+    Picking one of several would be a guess, and the wrong guess is written
+    into by a caller that asked for "the" notes and got another — so several
+    are listed and none is chosen, exactly as `sortyourpaperya note` does.
+    """
+    if name:
+        return at(name)
+    if len(existing) > 1:
+        listed = "\n".join(f"  {path.name}" for path in existing)
+        raise BibError(f"{subject} has several notes. Name one:\n{listed}")
+    return existing[0] if existing else at("")
+
+
+def _cited_source(bibliography: Bibliography, library_root: Path, needle: str):
+    """The source a `--cite` names: its citation key, or the document it cites.
+
+    The key is tried first and exactly, so a note can always be opened on a
+    source whose document has since left the library — the bibliography still
+    cites it, and what was written about it is still worth reading.
+    """
+    exact = next((s for s in bibliography.sources if s.key == needle), None)
+    if exact is not None:
+        return exact
+
+    with _reading(library_root) as library:
+        paper = _resolve(library, needle)
+    source = bibliography.source_for(paper.file_id)
+    if source is None:
+        raise BibError(
+            f"{bibliography.slug} does not cite {paper.file_id}; "
+            f"`sortyourpaperya bib add --lib {bibliography.slug} "
+            f"--cite {paper.file_id}` does"
+        )
+    return source
+
+
+def _open_or_print(path: Path, path_only: bool) -> None:
+    """Hand the note to $EDITOR, or print where it is.
+
+    A caller that means to write the note itself has no use for an editor, and
+    one inheriting an `$EDITOR` it cannot drive would be left holding a
+    terminal open forever.
+    """
     editor = None if path_only else (os.environ.get("VISUAL") or os.environ.get("EDITOR"))
     if editor:
         # Split so EDITOR="code -w" works, and let the editor own the terminal.
         subprocess.call([*editor.split(), str(path)])
     else:
-        # No editor configured, so print the path for the caller to use.
         typer.echo(path)
+
+
+def _link_here(bibliography: Bibliography) -> None:
+    """Link the bibliography's folder into the directory the command was run in."""
+    try:
+        link = bibs.link_into(bibliography, Path.cwd())
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+    typer.echo(f"  linked  {link} -> {bibliography.path}")
+
+
+def _pick_bib(library_root: Path, needle: str | None) -> Bibliography:
+    """The bibliography a command should write to, asking when it was not told.
+
+    Named ones are looked up and never guessed at. Unnamed, the choices are
+    printed and one is asked for, with the first offered as the default — so a
+    library with a single bibliography takes one keystroke, and a library with
+    several cannot have the wrong one picked for it.
+    """
+    if needle:
+        try:
+            return bibs.open_bib(library_root, needle)
+        except BibError as err:
+            typer.echo(f"error: {err}", err=True)
+            raise typer.Exit(code=1) from err
+
+    found = bibs.all_bibs(library_root)
+    if not found:
+        typer.echo(
+            "error: this library has no bibliography yet; "
+            "`sortyourpaperya bib init <name>` starts one",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    for entry in found:
+        typer.echo(f"  {entry.slug:<24}  {entry.id}  {entry.name}", err=True)
+    answer = _prompt("which bibliography? (slug or id)", default=found[0].slug)
+    try:
+        return bibs.open_bib(library_root, answer)
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
 
 
 @app.command("migrate-store")
@@ -539,7 +1118,7 @@ def migrate_store(
 ) -> None:
     """Bring the store's layout and filenames in line with the current rules."""
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         moved = library.migrate_store_layout()
         for file_id in moved:
             paper = library.db.get(file_id)
@@ -573,7 +1152,7 @@ def fsck(
     else can find.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         missing = library.missing_files()
         orphans = library.orphans()
 
@@ -617,7 +1196,7 @@ def scan(
 ) -> None:
     """Re-check stored files and refresh the hashes of any edited in place."""
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         report = library.rescan()
         typer.echo(
             f"checked {report.checked} document(s); "
@@ -647,7 +1226,7 @@ def remove(
     changes as the library grows, and an unattended delete must not.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         if yes and library.db.get(file_id) is None:
             typer.echo(
                 f"error: --yes needs an exact id, and {file_id!r} is not one.",
@@ -663,12 +1242,58 @@ def remove(
         paper = _resolve(library, file_id)
         if not yes:
             typer.echo(f"{paper.store_name}\n  {_label(paper)}")
+            # What cites it, before it goes. The entry survives the document and
+            # keeps working — a citation is a claim about a paper, not about a
+            # file you hold — but it stops leading anywhere, and that is worth
+            # knowing while the choice is still open.
+            for citation in bibs.citations_of(library.root, paper.file_id):
+                typer.echo(f"  cited by {citation.bib_slug} as {citation.key}")
             # The stored file is the only copy when it arrived by move, so this
             # is not undoable.
             typer.confirm("permanently delete this document?", abort=True)
 
         library.remove(paper.file_id)
         typer.echo(f"removed {paper.file_id}")
+
+
+@app.command()
+def cited(
+    file_id: str = typer.Argument(..., help="Document id, or words from its title, authors, or keywords."),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print records instead of a table, for a program to read."
+    ),
+) -> None:
+    """Say which of the library's bibliographies cite a document, and as what.
+
+    The question `bib add` answers in one direction, asked in the other: not
+    "what does this manuscript cite" but "where have I already used this".
+
+    Nothing is stored to answer it. Each bibliography's record already names the
+    `file_id` it cites, so this reads them — which is why a `bib.toml` edited by
+    hand is answered correctly the moment it is saved, with nothing to rebuild.
+    """
+    settings = _settings(None, library_dir)
+    with _reading(settings.output_dir) as library:
+        paper = _resolve(library, file_id)
+    found = bibs.citations_of(settings.output_dir, paper.file_id)
+
+    if as_json:
+        typer.echo(json.dumps(_cited_by(found), indent=2))
+        return
+    if not found:
+        typer.echo(f"no bibliography cites {paper.file_id}")
+        return
+    for citation in found:
+        typer.echo(f"{citation.bib_slug:<24}  {citation.key}")
+
+
+def _cited_by(found: Sequence["bibs.Citation"]) -> list[dict]:
+    """Citations as records. The slug names the bibliography a caller would use."""
+    return [
+        {"bib": citation.bib_slug, "bib_id": citation.bib_id, "key": citation.key}
+        for citation in found
+    ]
 
 
 @app.command()
@@ -682,7 +1307,7 @@ def backup(
     tree` rebuilds it. Run it from cron or a launchd agent for a nightly copy.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         try:
             report = library.backup(destination)
         except LibraryError as err:
@@ -692,6 +1317,9 @@ def backup(
     typer.echo(f"backed up {report.documents} document(s) to {report.destination}")
     typer.echo(f"  database  {report.database.name}")
     typer.echo(f"  store     {report.bytes_copied / 1e6:.1f} MB")
+    if report.bibliographies:
+        plural = "y" if report.bibliographies == 1 else "ies"
+        typer.echo(f"  bibs      {report.bibliographies} bibliograph{plural}")
     typer.echo("  the tree is not copied; `sortyourpaperya tree` rebuilds it")
 
 
@@ -710,7 +1338,7 @@ def cache(
     next pass asks the model again.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         if forget:
             typer.echo(f"forgot {library.db.forget_model_answers()} banked answer(s)")
             return
@@ -726,6 +1354,258 @@ def cache(
             f"reused for {days} day(s), then asked again — a label is a choice "
             "made against the categories the library had at the time"
         )
+
+
+@app.command()
+def doctor(
+    offline: bool = typer.Option(
+        False, "--offline", help="Skip the API call that checks the key actually works."
+    ),
+) -> None:
+    """Check the watcher and the model: what is set up, what is running, what works.
+
+    Exits non-zero when something is wrong, so it can gate a script. The API
+    check lists models rather than labelling anything — that call is free, so
+    running this never costs money.
+    """
+    problems: list[str] = []
+
+    def ok(line: str) -> None:
+        typer.echo(f"  ok    {line}")
+
+    def bad(line: str, fix: str) -> None:
+        typer.echo(f"  FAIL  {line}")
+        problems.append(fix)
+
+    def warn(line: str) -> None:
+        typer.echo(f"  warn  {line}")
+
+    typer.echo("watcher")
+    _doctor_watcher(ok, bad, warn)
+    typer.echo("\nmodel")
+    _doctor_model(ok, bad, warn, offline=offline)
+
+    if problems:
+        typer.echo("\nto fix:")
+        for fix in problems:
+            typer.echo(f"  {fix}")
+        raise typer.Exit(code=1)
+    typer.echo("\nnothing to fix")
+
+
+def _doctor_watcher(ok, bad, warn) -> None:
+    """The folders, the registry, and whether anything is actually watching."""
+    from .watchlock import live_claims, locks_dir
+
+    if shutil.which("pdftoppm"):
+        ok("pdftoppm found, so scanned documents can be read")
+    else:
+        # Only scans need it, so this is a warning: everything else works.
+        warn("pdftoppm not found — documents with no text layer will fail")
+
+    try:
+        registry = load_registry()
+    except RegistryError as err:
+        bad(f"registry unreadable: {err}", "fix the registry file named above")
+        return
+
+    if not registry.watches:
+        bad(
+            f"no watches declared in {registry.path}",
+            "declare a watch — see `sypy watches`",
+        )
+        return
+
+    claimed = {path: pid for path, pid in live_claims(locks_dir()).items()}
+    for entry in registry.watches.values():
+        name = entry.name
+        if entry.input_dir.is_dir():
+            ok(f"{name}: watching {entry.input_dir}")
+        else:
+            bad(
+                f"{name}: input folder is missing — {entry.input_dir}",
+                f"create {entry.input_dir}, or point the watch somewhere else",
+            )
+        if (entry.library_dir / "papers.duckdb").exists():
+            ok(f"{name}: library at {entry.library_dir}")
+        elif entry.library_dir.is_dir():
+            warn(f"{name}: library {entry.library_dir} exists but holds nothing yet")
+        else:
+            warn(f"{name}: library {entry.library_dir} will be created on first run")
+
+        holder = claimed.get(entry.input_dir) or claimed.get(entry.library_dir)
+        if holder:
+            ok(f"{name}: running, pid {holder}")
+        elif _service_file():
+            bad(
+                f"{name}: a service is installed but nothing is running",
+                "start it: `systemctl --user start sortyourpaperya` "
+                "(or `launchctl kickstart`), and check `journalctl --user -u sortyourpaperya`",
+            )
+        else:
+            warn(f"{name}: stopped, and no background service is installed")
+
+
+def _service_file() -> Path | None:
+    """The unit or plist a `--service` install writes, if one is there."""
+    for path in (
+        Path.home() / ".config/systemd/user/sortyourpaperya.service",
+        Path.home() / "Library/LaunchAgents/com.sortyourpaperya.watcher.plist",
+    ):
+        if path.exists():
+            return path
+    return None
+
+
+def _serving_watcher() -> dict | None:
+    """What the watcher for this library says about itself, if one is serving."""
+    from . import client
+
+    try:
+        root = _resolved_library(None)
+        if root is None or not client.serving(root):
+            return None
+        return client.call(root, "ping")
+    except Exception:
+        return None
+
+
+def _doctor_model(ok, bad, warn, *, offline: bool) -> None:
+    """The key, the model, and what the day's spend has left."""
+    # The watcher is what spends, so it is what gets asked. Reading the keychain
+    # from here would prompt for a password and still answer the wrong question.
+    watcher = _serving_watcher()
+    key = None
+    if watcher is not None:
+        if watcher.get("has_key"):
+            if offline:
+                ok("the watcher has a key")
+            else:
+                # "Has a key" is not "has a key that works", and only the
+                # watcher can find out which -- the key is its to read.
+                from . import client as _client
+
+                verdict = _client.call(_resolved_library(None), "probe")
+                if verdict.get("ok"):
+                    ok("the API accepts the watcher's key")
+                else:
+                    bad(
+                        f"the API refused the watcher's key: {verdict.get('detail')}",
+                        "run `sypy login` with a working key, then restart the watcher",
+                    )
+        else:
+            bad("the watcher has no API key", "run `sypy login`, then restart the watcher")
+    else:
+        try:
+            key = resolve_api_key()
+            ok(f"key set for commands run by hand (…{key[-4:]})")
+        except ConfigError:
+            warn(
+                "no watcher running, and no key set for this shell -- "
+                "`sypy login` stores one for the watcher; OPENAI_API_KEY covers a single run"
+            )
+
+    model = resolve_settings(None, None).model
+    ok(f"model {model}")
+
+    if key and not offline:
+        detail = _probe_api(key)
+        if detail is None:
+            ok("the API accepts the key")
+        else:
+            bad(f"the API refused: {detail}", "check the key, then `sypy login`")
+
+    ledger = Budget()
+    used, limits = ledger.usage(), ledger.limits
+    if limits.unlimited:
+        # The watcher restarts on failure; with no ceiling a loop can pay forever.
+        warn("no spend ceiling set — SYP_MAX_REQUESTS_PER_DAY / SYP_MAX_TOKENS_PER_DAY")
+    elif used.requests >= limits.requests_per_day:
+        bad(
+            f"the day's request ceiling is spent ({used.requests}/{limits.requests_per_day})",
+            "wait for the window to roll over, or `sypy budget --reset`",
+        )
+    else:
+        ok(f"spend today {used.requests}/{limits.requests_per_day} requests")
+
+
+def _probe_api(key: str) -> str | None:
+    """None when the key works, else one line saying why not.
+
+    Lists models rather than asking for a completion: it is the cheapest call
+    that still proves the key is accepted, and it is free, so `doctor` never
+    costs anything to run.
+    """
+    try:
+        from openai import OpenAI
+
+        OpenAI(api_key=key, max_retries=0, timeout=15).models.list()
+    except Exception as exc:
+        return f"{type(exc).__name__}: {str(exc).splitlines()[0][:120]}"
+    return None
+
+
+@app.command()
+def login(
+    key: str = typer.Option(
+        None, "--key", help="The key, for a script. Omit it to be prompted."
+    ),
+) -> None:
+    """Store the API key in the system keychain.
+
+    The keychain, rather than a file or a shell profile: it is encrypted at
+    rest, it unlocks when you log in, and a service started by launchd or
+    systemd can read it — none of which is true of a key exported in .zshrc.
+    """
+    secret = (key or typer.prompt("API key", hide_input=True)).strip()
+    if not secret:
+        raise typer.BadParameter("no key given")
+    try:
+        store_api_key(secret)
+    except ConfigError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=2) from err
+    # Never the key itself; enough to tell two keys apart when one stops working.
+    typer.echo(f"stored in the keychain as {KEYRING_SERVICE} (…{secret[-4:]})")
+
+
+@app.command()
+def logout() -> None:
+    """Remove the stored API key from the system keychain."""
+    try:
+        removed = forget_api_key()
+    except ConfigError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=2) from err
+    typer.echo("removed from the keychain" if removed else "nothing stored")
+    # An exported key would silently take over from here, which looks like the
+    # logout failed. Say so instead.
+    for name in ("OPENAI_API_KEY", "SYP_API_KEY", "OEPNAI_API_KEY"):
+        if (os.environ.get(name) or "").strip():
+            typer.echo(f"note: {name} is still set in this environment and will be used")
+            break
+
+
+@app.command("whoami", hidden=True)
+def whoami() -> None:
+    """Where the key is coming from, without printing it.
+
+    The stored key is not read here. This is a client, and reading the keychain
+    from one is what puts a password dialog in front of whoever is sitting
+    there -- the thing the spender rule exists to avoid. The watcher is asked
+    instead, since it is the process that would spend it.
+    """
+    watcher = _serving_watcher()
+    if watcher is not None:
+        typer.echo(
+            "the watcher has a key" if watcher.get("has_key") else "the watcher has no key"
+        )
+        return
+    for name in ("OPENAI_API_KEY", "SYP_API_KEY", "OEPNAI_API_KEY"):
+        if (value := (os.environ.get(name) or "").strip()):
+            typer.echo(f"{name} (…{value[-4:]})")
+            return
+    typer.echo("no key set for this shell; `sypy login` stores one for the watcher")
 
 
 @app.command()
@@ -837,7 +1717,7 @@ def list_papers(
     """List what the library holds."""
     settings = _settings(None, library_dir)
     _check_sort(sort)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         _report(library, library.db.all_papers(sort=sort), as_json=as_json)
 
 
@@ -872,7 +1752,7 @@ def find(
     """
     settings = _settings(None, library_dir)
     _check_sort(sort)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         # One more than will be shown, which is how the cap is noticed. A
         # capped result that says nothing about it reads as the whole answer,
         # and the reader stops looking for the document that was cut off.
@@ -903,7 +1783,7 @@ def categories(
     question the database can group.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         counted = library.db.category_counts()
     if as_json:
         typer.echo(
@@ -941,7 +1821,7 @@ def attr(
     replaces what was there.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _writing(settings.output_dir) as library:
         paper = _resolve(library, file_id)
 
         if unset:
@@ -1000,7 +1880,7 @@ def sql(
     DuckDB allows one process, and it refuses a second connection even to read.
     """
     settings = _settings(None, library_dir)
-    with Library(settings.output_dir) as library:
+    with _reading(settings.output_dir) as library:
         try:
             # One more than will be shown, which is how the cap is noticed.
             columns, rows = library.db.select(
@@ -1037,6 +1917,45 @@ def sql(
         )
 
 
+@contextlib.contextmanager
+def _writing(root: Path):
+    """A library to change, whoever is holding it.
+
+    The watcher owns the write connection while it runs, so a command that would
+    otherwise wait out a pass -- or fail after 30s -- asks it to do the write
+    instead. With no watcher, this is exactly what it always was.
+    """
+    from . import client
+
+    with client.writing(root) as library:
+        if library is not None:
+            yield library
+            return
+    with Library(root) as library:
+        yield library
+
+
+@contextlib.contextmanager
+def _reading(root: Path):
+    """A library to read from, whoever else is using it.
+
+    Read-only connections coexist, so this works with no watcher running -- the
+    library stays readable when nothing is serving it. When a pass does hold the
+    lock, the watcher answers instead of the file; and when there is no watcher
+    to ask, this waits the way it always has.
+    """
+    from . import client
+
+    with client.reading(root) as library:
+        if library is not None:
+            yield library
+            return
+    # Locked, and nobody to ask. Wait it out, as every command did before there
+    # was a watcher to ask at all.
+    with Library(root) as library:
+        yield library
+
+
 def _report(library: Library, papers: Sequence[Paper], *, as_json: bool) -> None:
     """Show what was found, either to a person or to whatever called this."""
     if as_json:
@@ -1044,10 +1963,19 @@ def _report(library: Library, papers: Sequence[Paper], *, as_json: bool) -> None
         # --json` describes the entire library, and each record already costs
         # three queries to hydrate.
         held = library.db.attributes_for([paper.file_id for paper in papers])
+        # And one read of the bibliographies for the whole page, for the same
+        # reason: `list --json` describes the entire library, and re-reading
+        # every `bib.toml` per document would read each of them once per row.
+        citing = bibs.citations(library.root)
         typer.echo(
             json.dumps(
                 [
-                    _describe(library, paper, held.get(paper.file_id, {}))
+                    _describe(
+                        library,
+                        paper,
+                        held.get(paper.file_id, {}),
+                        citing.get(paper.file_id, []),
+                    )
                     for paper in papers
                 ],
                 indent=2,
@@ -1061,7 +1989,10 @@ def _report(library: Library, papers: Sequence[Paper], *, as_json: bool) -> None
 
 
 def _describe(
-    library: Library, paper: Paper, attributes: dict[str, str | None] | None = None
+    library: Library,
+    paper: Paper,
+    attributes: dict[str, str | None] | None = None,
+    citing: "Sequence[bibs.Citation] | None" = None,
 ) -> dict:
     """One document as a record, with the paths that lead to it.
 
@@ -1069,8 +2000,8 @@ def _describe(
     particular, and a record whose file cannot be opened from it is only half
     an answer.
 
-    `attributes` is passed in when the caller has already fetched them for a
-    whole page of results; left out, this fetches the one document's.
+    `attributes` and `citing` are passed in when the caller has already gathered
+    them for a whole page of results; left out, this gathers the one document's.
     """
     return {
         "id": paper.file_id,
@@ -1091,6 +2022,11 @@ def _describe(
         "pages_read": paper.pages_read,
         "attributes": (
             library.db.attributes(paper.file_id) if attributes is None else attributes
+        ),
+        "cited_by": _cited_by(
+            bibs.citations_of(library.root, paper.file_id)
+            if citing is None
+            else citing
         ),
     }
 
@@ -1119,8 +2055,13 @@ def _resolved_library(library_dir: Path | None, watch_name: str | None = None) -
     CLI beats the environment beats the registry, which is the order the rest of
     the settings already resolve in.
     """
-    if library_dir is not None or os.environ.get("SYP_OUTPUT"):
+    if library_dir is not None:
         return library_dir
+    if (from_env := os.environ.get("SYP_OUTPUT")):
+        # Named, just not on the command line. Returning None here left callers
+        # that ask "is a watcher serving this library?" unable to answer, so a
+        # command with SYP_OUTPUT set never found the watcher that was serving it.
+        return Path(from_env).expanduser()
     try:
         entry = _watch_entry(watch_name)
     except typer.Exit:

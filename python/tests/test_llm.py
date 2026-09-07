@@ -119,6 +119,23 @@ def test_the_re_ask_tells_the_model_what_was_already_turned_down() -> None:
     assert "Do not return any of them" in prompt
 
 
+def test_a_steer_outranks_the_paths_already_turned_down() -> None:
+    """The person has read the document; they may be walking back a refusal."""
+    from sortyourpaperya.llm import build_category_prompt
+
+    prompt = build_category_prompt(
+        _text(),
+        "Psychology/Research Methods",
+        [],
+        ["Psychology/Statistics"],
+        "it is about the maths, not the clinic",
+    )
+
+    assert "it is about the maths, not the clinic" in prompt
+    assert "where it conflicts with anything above, it wins" in prompt
+    assert prompt.index("already offered and rejected") < prompt.index("has read it")
+
+
 def test_the_re_ask_weighs_existing_paths_rather_than_preferring_them() -> None:
     """The ingest prompt's preference is what misfiles a document.
 

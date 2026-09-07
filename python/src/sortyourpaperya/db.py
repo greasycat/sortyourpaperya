@@ -325,12 +325,25 @@ def is_read_only(sql: str) -> bool:
     return words[0].lower() in _READ_ONLY_HEADS
 
 
+class Locked(RuntimeError):
+    """A read could not start because a writer holds the database.
+
+    Raised instead of waiting only when the caller asked for that, by passing
+    `fail_on_lock` -- which it does when it has somewhere else to ask.
+    """
+
+
 class PaperDb:
     """Connection to the library database."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, *, read_only: bool = False, fail_on_lock: bool = False
+    ) -> None:
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        self.fail_on_lock = fail_on_lock
+        if not read_only:
+            path.parent.mkdir(parents=True, exist_ok=True)
         self._connection: duckdb.DuckDBPyConnection | None = None
 
     @property
@@ -344,7 +357,12 @@ class PaperDb:
         """
         if self._connection is None:
             self._connection = self._connect()
-            self._migrate()
+            # A read-only connection cannot run the migration DDL, and does not
+            # need to: it is only ever opened against a database some writer
+            # already made. Trying would fail with a permissions error that says
+            # nothing about the real cause.
+            if not self.read_only:
+                self._migrate()
         return self._connection
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
@@ -357,9 +375,16 @@ class PaperDb:
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
             try:
-                return duckdb.connect(str(self.path))
+                return duckdb.connect(str(self.path), read_only=self.read_only)
             except duckdb.IOException as err:
-                if "lock" not in str(err).lower() or time.monotonic() >= deadline:
+                if "lock" not in str(err).lower():
+                    raise
+                if self.fail_on_lock:
+                    # The caller has somewhere else to ask -- the watcher holding
+                    # this lock can answer now, where waiting out an ingest pass
+                    # could take minutes.
+                    raise Locked(str(err)) from err
+                if time.monotonic() >= deadline:
                     raise
                 time.sleep(_LOCK_POLL_SECONDS)
 
