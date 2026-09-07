@@ -975,10 +975,36 @@ spend ledger — is `SORTYOURPAPERYA_STATE_DIR`, defaulting to `~/.local/state/s
 registry is `SORTYOURPAPERYA_CONFIG_DIR`, and `SORTYOURPAPERYA_LOG_FILE` turns on the rotating log
 (the service sets it; a second process rotating the same file can lose lines).
 
-The API key is read from `OPENAI_API_KEY`, `SYP_API_KEY`, or `OEPNAI_API_KEY`,
+The API key comes from the keychain first, then from `OPENAI_API_KEY`,
+`SYP_API_KEY`, or `OEPNAI_API_KEY`,
 including from the repository-root `.env`. The third spelling is a typo this
 repo's `.env` currently carries; it is accepted so the tool works as-is,
 and the correct spelling wins when both are set.
+
+## The API key
+
+```bash
+sypy login       # prompts, stores it in the system keychain
+sypy logout      # forget it
+```
+
+macOS Keychain and the Linux Secret Service, whichever the machine has. Both
+unlock when you log in, so the watcher has the key after a reboot without
+anything being typed — which a key exported in `.zshrc` does not, because
+neither launchd nor systemd inherits the shell that installed the service.
+
+The keychain wins over the environment. Otherwise `login` would appear to do
+nothing on a machine whose shell profile still exports last year's key.
+
+`--key` takes the value directly, for a script. Without it the prompt is
+hidden, so the key is not left in shell history.
+
+A machine with no keychain — a container, a headless box with no Secret Service
+— is not an error: it falls through to the environment, which is what a
+container was going to use anyway. Nothing that worked before stops working.
+
+`sypy whoami` says where the key is coming from, and prints its last
+four characters rather than the key.
 
 ## Known gaps
 

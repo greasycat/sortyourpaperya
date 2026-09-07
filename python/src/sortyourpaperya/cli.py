@@ -17,6 +17,10 @@ from . import notes
 from .bib import BibError, Bibliography
 from .budget import Budget
 from .config import (
+    KEYRING_SERVICE,
+    forget_api_key,
+    key_from_keychain,
+    store_api_key,
     MAX_STEERING_CATEGORIES,
     DEFAULT_LABEL_CACHE_DAYS,
     DEFAULT_LLM_MAX_RETRIES,
@@ -1290,6 +1294,61 @@ def cache(
             f"reused for {days} day(s), then asked again — a label is a choice "
             "made against the categories the library had at the time"
         )
+
+
+@app.command()
+def login(
+    key: str = typer.Option(
+        None, "--key", help="The key, for a script. Omit it to be prompted."
+    ),
+) -> None:
+    """Store the API key in the system keychain.
+
+    The keychain, rather than a file or a shell profile: it is encrypted at
+    rest, it unlocks when you log in, and a service started by launchd or
+    systemd can read it — none of which is true of a key exported in .zshrc.
+    """
+    secret = (key or typer.prompt("API key", hide_input=True)).strip()
+    if not secret:
+        raise typer.BadParameter("no key given")
+    try:
+        store_api_key(secret)
+    except ConfigError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=2) from err
+    # Never the key itself; enough to tell two keys apart when one stops working.
+    typer.echo(f"stored in the keychain as {KEYRING_SERVICE} (…{secret[-4:]})")
+
+
+@app.command()
+def logout() -> None:
+    """Remove the stored API key from the system keychain."""
+    try:
+        removed = forget_api_key()
+    except ConfigError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=2) from err
+    typer.echo("removed from the keychain" if removed else "nothing stored")
+    # An exported key would silently take over from here, which looks like the
+    # logout failed. Say so instead.
+    for name in ("OPENAI_API_KEY", "SYP_API_KEY", "OEPNAI_API_KEY"):
+        if (os.environ.get(name) or "").strip():
+            typer.echo(f"note: {name} is still set in this environment and will be used")
+            break
+
+
+@app.command("whoami", hidden=True)
+def whoami() -> None:
+    """Where the key is coming from, without printing it."""
+    stored = key_from_keychain()
+    if stored:
+        typer.echo(f"keychain (…{stored[-4:]})")
+        return
+    for name in ("OPENAI_API_KEY", "SYP_API_KEY", "OEPNAI_API_KEY"):
+        if (value := (os.environ.get(name) or "").strip()):
+            typer.echo(f"{name} (…{value[-4:]})")
+            return
+    typer.echo("no key; run `sypy login`")
 
 
 @app.command()

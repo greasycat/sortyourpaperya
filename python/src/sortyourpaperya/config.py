@@ -125,20 +125,94 @@ def resolve_settings(
     )
 
 
+KEYRING_SERVICE = "sortyourpaperya"
+KEYRING_USERNAME = "openai"
+
+
 def resolve_api_key() -> str:
-    """Read the OpenAI key from the environment.
+    """The OpenAI key: from the keychain if `login` put one there, else the environment.
+
+    The keychain comes first because it is the one place the key is neither in
+    a file next to the code nor in a shell profile that no supervisor inherits.
+    `sypy login` puts it there; macOS Keychain and the Linux Secret
+    Service both unlock at login, so the watcher has it after a reboot without
+    anything being typed.
+
+    The environment still works and is still what a container or a CI job uses,
+    so nothing that worked before stops working.
 
     ``OEPNAI_API_KEY`` is accepted because the repository's own ``.env`` spells
     it that way; the correct spelling wins when both are set.
     """
+    stored = key_from_keychain()
+    if stored:
+        return stored
     load_dotenv(_repo_dotenv(), override=False)
     for name in ("OPENAI_API_KEY", "SYP_API_KEY", "OEPNAI_API_KEY"):
         value = (os.getenv(name) or "").strip()
         if value:
             return value
     raise ConfigError(
-        "no API key found; set OPENAI_API_KEY in the environment or in .env"
+        "no API key found; run `sypy login`, "
+        "or set OPENAI_API_KEY in the environment or in .env"
     )
+
+
+def key_from_keychain() -> str | None:
+    """The stored key, or None when there is none or no keychain to ask.
+
+    A machine with no keychain — a container, a headless box with no Secret
+    Service running — is not an error here: it is the ordinary case for the
+    environment variable below, so a missing backend falls through rather than
+    refusing to start.
+    """
+    try:
+        import keyring
+
+        return (keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or "").strip() or None
+    except Exception:
+        return None
+
+
+def store_api_key(key: str) -> None:
+    """Put the key in the platform keychain. Raises ConfigError if there is none."""
+    try:
+        import keyring
+
+        keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, key)
+    except Exception as exc:
+        raise ConfigError(f"no keychain available to store the key: {exc}") from exc
+
+
+def forget_api_key() -> bool:
+    """Remove the stored key. True if there was one, False if there was nothing.
+
+    A backend can refuse the delete while allowing a write: a Secret Service
+    collection that is locked raises on `delete_password`, and gnome-keyring
+    routinely has a locked collection beside an unlocked one. Logging out has
+    to work anyway, so the key is overwritten with nothing when the delete is
+    refused — `key_from_keychain` reads a blank entry as no key, so the effect
+    on every later run is the same. Only if that also fails is it an error.
+    """
+    try:
+        import keyring
+    except Exception as exc:
+        raise ConfigError(f"no keychain available: {exc}") from exc
+
+    try:
+        if not (keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or "").strip():
+            return False
+    except Exception as exc:
+        raise ConfigError(f"cannot read the keychain: {exc}") from exc
+
+    try:
+        keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
+    except Exception:
+        try:
+            keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, "")
+        except Exception as exc:
+            raise ConfigError(f"could not clear the stored key: {exc}") from exc
+    return True
 
 
 def _repo_dotenv() -> Path:
