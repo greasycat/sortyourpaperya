@@ -30,6 +30,7 @@ are categorized on their own terms.
 ./install.sh                              # macOS or Linux; installs `sortyourpaperya`
 
 sypy login                                           # store your API key in the keychain
+sypy doctor                                          # check the watcher and the model
 sypy ingest --input ./inbox                          # preview: nothing is written
 sypy ingest --input ./inbox --mode copy              # copy in, leave the source alone
 sypy watch  --input ./inbox --mode copy              # keep doing it as documents arrive

@@ -1297,6 +1297,159 @@ def cache(
 
 
 @app.command()
+def doctor(
+    offline: bool = typer.Option(
+        False, "--offline", help="Skip the API call that checks the key actually works."
+    ),
+) -> None:
+    """Check the watcher and the model: what is set up, what is running, what works.
+
+    Exits non-zero when something is wrong, so it can gate a script. The API
+    check lists models rather than labelling anything — that call is free, so
+    running this never costs money.
+    """
+    problems: list[str] = []
+
+    def ok(line: str) -> None:
+        typer.echo(f"  ok    {line}")
+
+    def bad(line: str, fix: str) -> None:
+        typer.echo(f"  FAIL  {line}")
+        problems.append(fix)
+
+    def warn(line: str) -> None:
+        typer.echo(f"  warn  {line}")
+
+    typer.echo("watcher")
+    _doctor_watcher(ok, bad, warn)
+    typer.echo("\nmodel")
+    _doctor_model(ok, bad, warn, offline=offline)
+
+    if problems:
+        typer.echo("\nto fix:")
+        for fix in problems:
+            typer.echo(f"  {fix}")
+        raise typer.Exit(code=1)
+    typer.echo("\nnothing to fix")
+
+
+def _doctor_watcher(ok, bad, warn) -> None:
+    """The folders, the registry, and whether anything is actually watching."""
+    from .watchlock import live_claims, locks_dir
+
+    if shutil.which("pdftoppm"):
+        ok("pdftoppm found, so scanned documents can be read")
+    else:
+        # Only scans need it, so this is a warning: everything else works.
+        warn("pdftoppm not found — documents with no text layer will fail")
+
+    try:
+        registry = load_registry()
+    except RegistryError as err:
+        bad(f"registry unreadable: {err}", "fix the registry file named above")
+        return
+
+    if not registry.watches:
+        bad(
+            f"no watches declared in {registry.path}",
+            "declare a watch — see `sypy watches`",
+        )
+        return
+
+    claimed = {path: pid for path, pid in live_claims(locks_dir()).items()}
+    for entry in registry.watches.values():
+        name = entry.name
+        if entry.input_dir.is_dir():
+            ok(f"{name}: watching {entry.input_dir}")
+        else:
+            bad(
+                f"{name}: input folder is missing — {entry.input_dir}",
+                f"create {entry.input_dir}, or point the watch somewhere else",
+            )
+        if (entry.library_dir / "papers.duckdb").exists():
+            ok(f"{name}: library at {entry.library_dir}")
+        elif entry.library_dir.is_dir():
+            warn(f"{name}: library {entry.library_dir} exists but holds nothing yet")
+        else:
+            warn(f"{name}: library {entry.library_dir} will be created on first run")
+
+        holder = claimed.get(entry.input_dir) or claimed.get(entry.library_dir)
+        if holder:
+            ok(f"{name}: running, pid {holder}")
+        elif _service_file():
+            bad(
+                f"{name}: a service is installed but nothing is running",
+                "start it: `systemctl --user start sortyourpaperya` "
+                "(or `launchctl kickstart`), and check `journalctl --user -u sortyourpaperya`",
+            )
+        else:
+            warn(f"{name}: stopped, and no background service is installed")
+
+
+def _service_file() -> Path | None:
+    """The unit or plist a `--service` install writes, if one is there."""
+    for path in (
+        Path.home() / ".config/systemd/user/sortyourpaperya.service",
+        Path.home() / "Library/LaunchAgents/com.sortyourpaperya.watcher.plist",
+    ):
+        if path.exists():
+            return path
+    return None
+
+
+def _doctor_model(ok, bad, warn, *, offline: bool) -> None:
+    """The key, the model, and what the day's spend has left."""
+    key = None
+    try:
+        key = resolve_api_key()
+    except ConfigError as err:
+        bad(str(err), "run `sypy login`")
+
+    if key:
+        source = "keychain" if key_from_keychain() == key else "the environment"
+        ok(f"key found in {source} (…{key[-4:]})")
+
+    model = resolve_settings(None, None).model
+    ok(f"model {model}")
+
+    if key and not offline:
+        detail = _probe_api(key)
+        if detail is None:
+            ok("the API accepts the key")
+        else:
+            bad(f"the API refused: {detail}", "check the key, then `sypy login`")
+
+    ledger = Budget()
+    used, limits = ledger.usage(), ledger.limits
+    if limits.unlimited:
+        # The watcher restarts on failure; with no ceiling a loop can pay forever.
+        warn("no spend ceiling set — SYP_MAX_REQUESTS_PER_DAY / SYP_MAX_TOKENS_PER_DAY")
+    elif used.requests >= limits.requests_per_day:
+        bad(
+            f"the day's request ceiling is spent ({used.requests}/{limits.requests_per_day})",
+            "wait for the window to roll over, or `sypy budget --reset`",
+        )
+    else:
+        ok(f"spend today {used.requests}/{limits.requests_per_day} requests")
+
+
+def _probe_api(key: str) -> str | None:
+    """None when the key works, else one line saying why not.
+
+    Lists models rather than asking for a completion: it is the cheapest call
+    that still proves the key is accepted, and it is free, so `doctor` never
+    costs anything to run.
+    """
+    try:
+        from openai import OpenAI
+
+        OpenAI(api_key=key, max_retries=0, timeout=15).models.list()
+    except Exception as exc:
+        return f"{type(exc).__name__}: {str(exc).splitlines()[0][:120]}"
+    return None
+
+
+@app.command()
 def login(
     key: str = typer.Option(
         None, "--key", help="The key, for a script. Omit it to be prompted."

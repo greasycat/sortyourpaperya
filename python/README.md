@@ -981,6 +981,30 @@ including from the repository-root `.env`. The third spelling is a typo this
 repo's `.env` currently carries; it is accepted so the tool works as-is,
 and the correct spelling wins when both are set.
 
+## Is it working
+
+```bash
+sypy doctor              # the watcher and the model, in one command
+sypy doctor --offline    # ...without the call that checks the key
+```
+
+Every check is one line saying `ok`, `warn`, or `FAIL`, and anything that
+failed is repeated at the end as the command that fixes it. It exits non-zero
+when something is wrong, so a script can gate on it.
+
+It checks that `pdftoppm` is there (without it, documents with no text layer
+fail and nothing else does), that each declared watch has a folder to watch and
+a library to write to, and whether anything is actually running — separating
+*stopped* from *a service is installed and yet nothing is running*, which is
+the case worth catching: the folder looks watched and nothing has been filed
+for a week. Then the key, the model, whether the API accepts the key, and what
+the day's spend has left.
+
+The API check lists models rather than labelling anything. That call is free,
+so `doctor` never costs money; `--offline` skips it anyway. Checking only that
+a key *exists* is the check that lulls you — an expired key looks exactly like
+a working one until the first document.
+
 ## The API key
 
 ```bash
