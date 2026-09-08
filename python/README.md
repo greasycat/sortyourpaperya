@@ -1012,6 +1012,31 @@ so `doctor` never costs money; `--offline` skips it anyway. Checking only that
 a key *exists* is the check that lulls you — an expired key looks exactly like
 a working one until the first document.
 
+## Picking several at once
+
+```bash
+sypy pick              # the whole library
+sypy pick "attention"  # only what matches
+```
+
+A tree of the library's categories. `j`/`k` or the arrows move, `l`/`h` open and
+close a category, and **space selects -- on a category, everything beneath it**,
+which is the point: twenty-two keystrokes become one. `d` deletes what is
+selected, after a confirmation naming what will go. `q` leaves without doing
+anything.
+
+It opens collapsed to the top level, so it stays readable as the library grows,
+and it refuses when there is no terminal to draw on rather than failing obscurely
+under cron or in a pipeline.
+
+Deletion is the same `remove` the command does, routed the same way -- the
+watcher performs it while it holds the write lock. One document refusing does not
+strand the rest; the result line says how many went and which did not.
+
+More operations will land on the same screen. Each is an entry in `OPERATIONS`
+(`pick.py`), which is where the key binding and the footer both come from, so
+adding one does not touch the drawing half.
+
 ## The watcher, and what talks to it
 
 While `sypy watch` runs it serves a Unix socket for its library, and the other

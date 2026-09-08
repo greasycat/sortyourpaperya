@@ -34,6 +34,7 @@ sypy doctor                                          # check the watcher and the
 sypy ingest --input ./inbox                          # preview: nothing is written
 sypy ingest --input ./inbox --mode copy              # copy in, leave the source alone
 sypy watch  --input ./inbox --mode copy              # keep doing it as documents arrive
+sypy pick                                            # choose several in a tree, and act on them
 ```
 
 Everything else — the store layout, the registry of watched folders, running it

@@ -256,3 +256,26 @@ def test_paths_do_not_cross_the_socket(library: Path, _short_runtime_dir: str) -
     finally:
         holder.kill()
         holder.wait()
+
+
+def test_a_bulk_delete_goes_through_the_watcher(library: Path, _short_runtime_dir: str) -> None:
+    """`pick`'s delete is `Library.remove`, so it routes like any other write.
+
+    Nothing new is exposed to do it -- `remove` was already in the whitelist --
+    but a bulk delete during a pass is exactly when this matters, so it is
+    asserted rather than assumed.
+    """
+    from sortyourpaperya import pick
+
+    holder = _holder(library, _short_runtime_dir, serve=True)
+    try:
+        with client.writing(library) as lib:
+            assert type(lib).__name__ == "RemoteLibrary"
+            outcome = pick.apply(pick.DELETE, lib, [lib.db.get("abc123")])
+            assert len(outcome.done) == 1 and not outcome.failed
+    finally:
+        holder.kill()
+        holder.wait()
+
+    with client.reading(library) as lib:
+        assert lib.db.get("abc123") is None

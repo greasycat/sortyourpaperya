@@ -293,6 +293,11 @@ and when a pass is holding it, asks the watcher instead.
   user names is `sortyourpaperya ingest --input <file>.pdf --mode copy` — that
   is one request paid for, where naming its folder would file everything else
   sitting in it too.
+- **`sypy pick` draws an interactive screen and waits for keystrokes.** Never run
+  it: there is nobody at the keyboard, and it will sit there until it is killed.
+  It refuses when there is no terminal, which is what you will get, but do not
+  reach for it. Everything it does has a scriptable form -- `find` and `list` to
+  choose, `remove` to delete.
 - **`sortyourpaperya remove` deletes the document, its notes, and its record.** When the
   document arrived by move, that is the only copy. Ask first, every time; pass
   `--yes` only after the user has said yes to that document, and only with an

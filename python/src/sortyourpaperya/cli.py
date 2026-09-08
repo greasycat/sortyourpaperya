@@ -39,6 +39,7 @@ from .ingest import ingest_folder
 import os
 import contextlib
 import shutil
+import sys
 import subprocess
 
 from .library import FilingMode, Library, LibraryError
@@ -1364,6 +1365,67 @@ def cache(
             f"reused for {days} day(s), then asked again — a label is a choice "
             "made against the categories the library had at the time"
         )
+
+
+@app.command()
+def pick(
+    query: str = typer.Argument(None, help="Only show what matches these words."),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Select documents in the category tree and act on them together.
+
+    j/k or the arrows move, space selects -- on a category, everything beneath
+    it -- o opens what is selected in whatever the desktop uses for it, or opens
+    the branch when the cursor is on a category, O opens what is selected with a
+    command you type (the path is piped in) or the category folder itself, r
+    moves everything selected to a category you type, and d deletes what is
+    selected, after asking. q leaves without doing anything.
+    """
+    from . import pick as picker
+
+    if not _interactive():
+        typer.echo(
+            "error: `pick` draws on a terminal, and there is not one here. "
+            "Use `find`, `list`, and `remove` from a script.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    settings = _settings(None, library_dir)
+
+    def load() -> list:
+        with _reading(settings.output_dir) as library:
+            papers = library.db.search(query) if query else library.db.all_papers()
+            return picker.build_tree(papers)
+
+    def on_apply(operation, chosen, answer, category) -> str:
+        # A change goes through the write seam, so the watcher performs it while
+        # it holds the lock -- the same route `remove` takes on its own. An
+        # operation that only reads takes the reading one instead, so opening a
+        # document does not queue behind a filing pass.
+        seam = _writing if operation.writes else _reading
+        with seam(settings.output_dir) as library:
+            outcome = picker.apply(operation, library, chosen, answer, category)
+            return outcome.describe(operation)
+
+    if not load():
+        typer.echo("nothing to pick from" if not query else f"nothing matches {query!r}")
+        return
+    picker.run(load, on_apply)
+
+
+def _interactive() -> bool:
+    """Whether there is a terminal to draw on.
+
+    The same question `_fzf_available` asks, and for the same reason: under cron
+    or in a pipeline there is nothing to draw on, and the picker would paint
+    escape codes into a log rather than say so.
+    """
+    try:
+        with open("/dev/tty"):
+            return sys.stdin.isatty() and sys.stdout.isatty()
+    except OSError:
+        return False
 
 
 @app.command()
