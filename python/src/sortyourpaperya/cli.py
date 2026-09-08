@@ -1374,11 +1374,11 @@ def pick(
 ) -> None:
     """Select documents in the category tree and act on them together.
 
-    j/k or the arrows move, space selects -- on a category, everything beneath
-    it -- o opens what is selected in whatever the desktop uses for it, or opens
-    the branch when the cursor is on a category, O opens what is selected with a
-    command you type (the path is piped in) or the category folder itself, r
-    moves everything selected to a category you type, and d deletes what is
+    j/k or the arrows move, l or Enter opens a category and h closes it, and
+    space selects -- on a category, everything beneath it. o opens what is
+    selected in whatever the desktop uses for it, O opens it with a command you
+    type (the path is piped in) or, on a category, opens that branch's folder,
+    r moves everything selected to a category you type, and d deletes what is
     selected, after asking. q leaves without doing anything.
     """
     from . import pick as picker

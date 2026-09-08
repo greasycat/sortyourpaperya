@@ -1019,23 +1019,44 @@ sypy pick              # the whole library
 sypy pick "attention"  # only what matches
 ```
 
-A tree of the library's categories. `j`/`k` or the arrows move, `l`/`h` open and
-close a category, and **space selects -- on a category, everything beneath it**,
-which is the point: twenty-two keystrokes become one. `d` deletes what is
-selected, after a confirmation naming what will go. `q` leaves without doing
-anything.
+A tree of the library's categories. `j`/`k` or the arrows move, `l` or Enter
+opens a category and `h` closes it, and **space selects -- on a category,
+everything beneath it**, which is the point: twenty-two keystrokes become one.
+`q` or Escape leaves without doing anything.
+
+Four things can be done to what is selected:
+
+| Key | Does | Asks first |
+|-----|------|------------|
+| `o` | open each selected document in whatever the desktop uses for it | no |
+| `O` | open with a command you type, the path piped in (`xargs -r zathura`); on a category, opens that branch's folder in `tree/` instead | the command |
+| `r` | move everything selected to a category you type | the category |
+| `d` | delete what is selected | a confirmation naming what will go |
+
+`r` asks for nothing more than the category, because typing one is already the
+decision and a shelf moved by mistake is put back by typing the old one. `d`
+asks, and its question names what will go and counts the rest rather than
+scrolling -- a question you have to scroll is one people stop reading.
+
+`O` is the only one that does something different when the cursor rests on a
+category, because a category has no path to pipe into a command; the desktop
+already knows what to do with a folder. The others act on the selection wherever
+the cursor happens to be, rather than opening the several hundred documents
+beneath a branch nobody asked for.
 
 It opens collapsed to the top level, so it stays readable as the library grows,
 and it refuses when there is no terminal to draw on rather than failing obscurely
 under cron or in a pipeline.
 
-Deletion is the same `remove` the command does, routed the same way -- the
-watcher performs it while it holds the write lock. One document refusing does not
-strand the rest; the result line says how many went and which did not.
+Deleting and retagging are the same `remove` and `retag` the commands do, routed
+the same way -- the watcher performs them while it holds the write lock. Opening
+takes the reading route instead, so it does not queue behind a filing pass. One
+document refusing does not strand the rest; the result line says how many went
+and which did not.
 
-More operations will land on the same screen. Each is an entry in `OPERATIONS`
-(`pick.py`), which is where the key binding and the footer both come from, so
-adding one does not touch the drawing half.
+Each operation is an entry in `OPERATIONS` (`pick.py`), which is where the key
+binding and the footer both come from, so adding one does not touch the drawing
+half.
 
 ## The watcher, and what talks to it
 
