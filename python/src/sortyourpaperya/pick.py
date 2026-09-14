@@ -13,9 +13,11 @@ its key bindings from there, so nothing in the drawing half changes.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Iterable, Sequence
 
 from .db import Paper
@@ -473,6 +475,9 @@ DOWN_KEYS = frozenset({"j"})
 UP_KEYS = frozenset({"k"})
 OPEN_KEYS = frozenset({"l", "\n", "\r"})
 CLOSE_KEYS = frozenset({"h"})
+# Leaves the tree for fzf. Not an Operation: it changes how the selection is
+# made, not what is done to it, and the operations run the same either way.
+FZF_KEY = "z"
 
 # What an arrow key sends, folded onto the letter that already means it, so the
 # model below is asked about one alphabet rather than two.
@@ -482,7 +487,8 @@ ARROWS = {"[A": "k", "[B": "j", "[C": "l", "[D": "h"}
 def footer() -> str:
     """The key legend, built from the registry so a new operation appears in it."""
     operations = "  ".join(f"{op.key} {op.label}" for op in OPERATIONS)
-    return f"j/k move  space select  a all  A none  {operations}  q quit"
+    fzf = f"  {FZF_KEY} fzf" if fzf_ready() else ""
+    return f"j/k move  space select  a all  A none  {operations}{fzf}  q quit"
 
 
 class Screen:
@@ -643,11 +649,118 @@ def _read_line(fd: int, show: Callable[[object], None], prompt: str) -> str | No
             typed += key
 
 
-def run(
+# ---- fzf ------------------------------------------------------------------
+#
+# A second way to make the selection, for when you know what you are looking
+# for. The tree shows what a library holds; fzf finds one document in six
+# hundred without scrolling past the other five hundred and ninety-nine. What
+# happens next is the same either way -- the operations below are the ones the
+# tree runs, reached through the same `act`.
+
+
+@lru_cache(maxsize=1)
+def fzf_ready() -> bool:
+    """Whether fzf is on PATH. Cached: the footer asks on every redraw."""
+    return shutil.which("fzf") is not None
+
+
+def _fzf_select(papers: Sequence[Paper]) -> list[Paper]:
+    """The documents chosen in fzf, or none when it was backed out of.
+
+    `--multi` because every operation here already acts on a set. The id leads
+    each line so the choice can be read back from it, and `--with-nth` keeps it
+    out of what is shown and searched -- the same shape `cli._pick_with_fzf`
+    uses, for the same reasons. Only stdout is captured: fzf paints itself on
+    the terminal, and taking stderr too would swallow the interface.
+
+    Authors and the year are on the line and not only in the title, because
+    `knuth 84` is how a document is remembered when its title is not. Everything
+    after the id is one searchable haystack -- fzf matches across the whole
+    line, so the order of the columns is a reading decision and nothing more.
+    """
+    lines = "\n".join(
+        "\t".join(
+            (
+                paper.file_id,
+                str(paper.year or "----"),
+                ", ".join(paper.authors) or "-",
+                " / ".join(paper.tags) or "-",
+                label(paper),
+            )
+        )
+        for paper in papers
+    )
+    result = subprocess.run(
+        [
+            "fzf",
+            "--multi",
+            "--prompt", "pick> ",
+            "--delimiter", "\t",
+            "--with-nth", "2..",
+            "--height", "60%",
+            "--reverse",
+            "--header", "tab selects another, enter takes what is selected",
+        ],
+        input=lines,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    # 0 chose something; 130 is an interrupt and 1 no match, both meaning no.
+    if result.returncode != 0:
+        return []
+    by_id = {paper.file_id: paper for paper in papers}
+    picked = (line.split("\t", 1)[0].strip() for line in result.stdout.splitlines())
+    return [by_id[found] for found in picked if found in by_id]
+
+
+def fzf_round(
     load: Callable[[], list[Node]],
     on_apply: Callable[[Operation, Sequence[Paper], str, "Node | None"], str],
 ) -> None:
-    """Show the tree until asked to stop.
+    """Choose in fzf, then do one thing to what was chosen.
+
+    No screen of our own, so the questions are plain `input()`: fzf has just
+    handed the terminal back in the state the shell left it, and putting it into
+    cbreak again to read a single `y` would buy nothing.
+
+    There is no category here -- fzf lists documents -- so operations that know
+    what to do with a folder act on the selection, as they do in the tree when
+    the cursor rests on a document.
+    """
+    papers = [paper for root in load() for paper in root.papers()]
+    if not papers:
+        print("nothing to pick from")
+        return
+    chosen = _fzf_select(papers)
+    if not chosen:
+        return
+    keys = "  ".join(f"{op.key} {op.label}" for op in OPERATIONS)
+    try:
+        print(f"{len(chosen)} selected: {_names(chosen)}")
+        operation = operation_for(input(f"{keys}  (anything else quits): ").strip())
+        if operation is None:
+            return
+        print(
+            act(
+                operation,
+                chosen,
+                lambda question: input(f"{question}\ny to confirm: ").strip() == "y",
+                on_apply,
+                request=lambda prompt: input(prompt),
+            )
+        )
+    except (EOFError, KeyboardInterrupt):  # ctrl-d or ctrl-c at a prompt: a no
+        print()
+
+
+def run(
+    load: Callable[[], list[Node]],
+    on_apply: Callable[[Operation, Sequence[Paper], str, "Node | None"], str],
+) -> str | None:
+    """Show the tree until asked to stop. Returns "fzf" when asked for fzf.
+
+    Leaving is how fzf is reached rather than drawing one inside the other: fzf
+    wants the terminal to itself, and the caller is where it can have it.
 
     `on_apply` performs an operation and returns the line to show afterwards,
     and `load` re-reads the tree. Both are passed in rather than imported:
@@ -669,6 +782,7 @@ def run(
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     screen = Screen(load(), Selection())
+    leaving: str | None = None
     # cbreak rather than raw: it leaves the interrupt character alone, so ctrl-c
     # still ends this the way it ends everything else.
     tty.setcbreak(fd)
@@ -683,6 +797,12 @@ def run(
                 key = _read_key(fd)
                 if key in QUIT_KEYS:
                     break
+                if key == FZF_KEY:
+                    if fzf_ready():
+                        leaving = "fzf"
+                        break
+                    screen.message = "fzf is not installed"
+                    continue
                 operation = screen.handle(key)
                 if operation is None:
                     continue
@@ -730,3 +850,4 @@ def run(
         pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    return leaving

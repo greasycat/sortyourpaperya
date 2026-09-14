@@ -8,6 +8,7 @@ nothing, so there is nothing in it a test would want to reach.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -191,7 +192,7 @@ def test_d_asks_for_the_delete_operation(roots) -> None:
 def test_an_unbound_key_does_nothing(roots) -> None:
     screen = pick.Screen(roots, pick.Selection())
     before = [screen.cursor, len(screen.selection)]
-    assert screen.handle("z") is None
+    assert screen.handle("Z") is None
     assert [screen.cursor, len(screen.selection)] == before
 
 
@@ -214,7 +215,7 @@ def test_no_operation_shadows_a_navigation_key() -> None:
         | pick.UP_KEYS
         | pick.OPEN_KEYS
         | pick.CLOSE_KEYS
-        | {" ", "a", "A"}
+        | {" ", "a", "A", pick.FZF_KEY}
     )
     for operation in pick.OPERATIONS:
         assert operation.key not in reserved
@@ -600,3 +601,99 @@ def test_retag_asks_for_a_category_and_takes_the_write_seam() -> None:
     assert pick.RETAG.prompt is not None
     assert pick.RETAG.confirm is None  # typing the category is the decision
     assert pick.RETAG.writes is True
+
+
+# ---- fzf -------------------------------------------------------------------
+
+
+def test_fzf_returns_what_was_selected(monkeypatch, tmp_path: Path) -> None:
+    """The ids on the chosen lines, back as documents, in the order fzf gave."""
+    library = Library(tmp_path / "lib")
+    _fill(library)
+    papers = library.db.all_papers()
+    shown = {}
+
+    def fake_run(argv, input, stdout, text):
+        shown["argv"], shown["lines"] = argv, input
+        chosen = input.splitlines()[:2]
+        return SimpleNamespace(returncode=0, stdout="\n".join(chosen) + "\n")
+
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+    got = pick._fzf_select(papers)
+
+    assert "--multi" in shown["argv"]
+    assert [p.file_id for p in got] == [
+        line.split("\t")[0] for line in shown["lines"].splitlines()[:2]
+    ]
+    # The id leads the line but is not what fzf shows or searches.
+    assert shown["argv"][shown["argv"].index("--with-nth") + 1] == "2.."
+
+
+def test_backing_out_of_fzf_selects_nothing(monkeypatch, tmp_path: Path) -> None:
+    library = Library(tmp_path / "lib")
+    _fill(library)
+    monkeypatch.setattr(
+        pick.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=130, stdout=""),
+    )
+    assert pick._fzf_select(library.db.all_papers()) == []
+
+
+def test_fzf_round_runs_the_operation_on_what_was_chosen(
+    monkeypatch, tmp_path: Path
+) -> None:
+    library = Library(tmp_path / "lib")
+    _fill(library)
+    papers = library.db.all_papers()
+    roots = pick.build_tree(papers)
+    done = {}
+
+    monkeypatch.setattr(pick, "_fzf_select", lambda _: papers[:1])
+    monkeypatch.setattr("builtins.input", lambda prompt="": pick.OPEN.key)
+
+    def on_apply(operation, chosen, answer, category):
+        done["call"] = (operation, list(chosen), category)
+        return "opened"
+
+    pick.fzf_round(lambda: roots, on_apply)
+    assert done["call"] == (pick.OPEN, papers[:1], None)
+
+
+def test_an_unknown_key_at_the_fzf_prompt_does_nothing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    library = Library(tmp_path / "lib")
+    _fill(library)
+    papers = library.db.all_papers()
+    monkeypatch.setattr(pick, "_fzf_select", lambda _: papers[:1])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "x")
+    pick.fzf_round(
+        lambda: pick.build_tree(papers),
+        lambda *a: pytest.fail("an unbound key ran an operation"),
+    )
+
+
+def test_the_author_and_the_year_are_searchable(monkeypatch) -> None:
+    """`knuth 84` is how a document is remembered when its title is not."""
+    paper = Paper(
+        file_id="abc123",
+        content_hash="h",
+        store_name="abc123__Computing",
+        title="The TeXbook",
+        year=1984,
+        authors=["Donald Knuth"],
+        tags=["Computing"],
+    )
+    shown = {}
+
+    def fake_run(argv, input, stdout, text):
+        shown["argv"], shown["line"] = argv, input
+        return SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+    pick._fzf_select([paper])
+
+    hidden, *searched = shown["line"].split("\t")
+    assert hidden == "abc123"  # read back from, never shown
+    assert "Donald Knuth" in searched and "1984" in searched

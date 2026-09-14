@@ -1017,6 +1017,7 @@ a working one until the first document.
 ```bash
 sypy pick              # the whole library
 sypy pick "attention"  # only what matches
+sypy pick --fzf        # no tree: type at a flat list instead
 ```
 
 A tree of the library's categories. `j`/`k` or the arrows move, `l` or Enter
@@ -1043,6 +1044,15 @@ category, because a category has no path to pipe into a command; the desktop
 already knows what to do with a folder. The others act on the selection wherever
 the cursor happens to be, rather than opening the several hundred documents
 beneath a branch nobody asked for.
+
+`z` swaps the tree for `fzf` when it is installed: the same four operations
+over a flat list you type at rather than walk, which is what you want when you
+know the document's name and not its shelf -- the year, the authors, the
+category and the title are all on the line, so `knuth 84` finds it. Tab selects
+another, Enter takes
+what is selected, and the operation is asked for afterwards by its key. It comes
+back to the tree when fzf is done with, because finding something is not leaving
+the picker; `--fzf` starts there and stays, and draws no tree at all.
 
 It opens collapsed to the top level, so it stays readable as the library grows,
 and it refuses when there is no terminal to draw on rather than failing obscurely

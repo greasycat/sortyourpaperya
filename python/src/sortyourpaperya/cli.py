@@ -1371,6 +1371,9 @@ def cache(
 def pick(
     query: str = typer.Argument(None, help="Only show what matches these words."),
     library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    fzf: bool = typer.Option(
+        False, "--fzf", help="Choose in fzf instead; no tree is drawn."
+    ),
 ) -> None:
     """Select documents in the category tree and act on them together.
 
@@ -1380,6 +1383,11 @@ def pick(
     type (the path is piped in) or, on a category, opens that branch's folder,
     r moves everything selected to a category you type, and d deletes what is
     selected, after asking. q leaves without doing anything.
+
+    z swaps the tree for fzf, which is the same operations over a flat list you
+    type at rather than walk -- what you want when you know the document's name
+    and not its shelf. It comes back to the tree afterwards; `--fzf` starts
+    there and stays, drawing no tree at all.
     """
     from . import pick as picker
 
@@ -1408,10 +1416,20 @@ def pick(
             outcome = picker.apply(operation, library, chosen, answer, category)
             return outcome.describe(operation)
 
+    if fzf and not picker.fzf_ready():
+        typer.echo("error: --fzf needs fzf on PATH", err=True)
+        raise typer.Exit(code=2)
+
     if not load():
         typer.echo("nothing to pick from" if not query else f"nothing matches {query!r}")
         return
-    picker.run(load, on_apply)
+    if fzf:
+        picker.fzf_round(load, on_apply)
+        return
+    # Back to the tree when fzf is done with: `z` is a way to find something,
+    # not a way out of the picker.
+    while picker.run(load, on_apply) == "fzf":
+        picker.fzf_round(load, on_apply)
 
 
 def _interactive() -> bool:
@@ -1606,13 +1624,24 @@ def _doctor_model(ok, bad, warn, *, offline: bool) -> None:
     if limits.unlimited:
         # The watcher restarts on failure; with no ceiling a loop can pay forever.
         warn("no spend ceiling set — SYP_MAX_REQUESTS_PER_DAY / SYP_MAX_TOKENS_PER_DAY")
-    elif used.requests >= limits.requests_per_day:
-        bad(
-            f"the day's request ceiling is spent ({used.requests}/{limits.requests_per_day})",
-            "wait for the window to roll over, or `sypy budget --reset`",
-        )
     else:
-        ok(f"spend today {used.requests}/{limits.requests_per_day} requests")
+        # Whichever ceilings are set, rather than requests alone: requests have
+        # no default ceiling, and a library that has run out of tokens is one
+        # whose every request now fails -- saying nothing about that is the
+        # question `doctor` exists to answer going unanswered.
+        for amount, ceiling, noun in (
+            (used.requests, limits.requests_per_day, "requests"),
+            (used.tokens, limits.tokens_per_day, "tokens"),
+        ):
+            if ceiling <= 0:
+                continue
+            if amount >= ceiling:
+                bad(
+                    f"the day's {noun} ceiling is spent ({amount}/{ceiling})",
+                    "wait for the window to roll over, or `sypy budget --reset`",
+                )
+            else:
+                ok(f"spend today {amount}/{ceiling} {noun}")
 
 
 def _probe_api(key: str) -> str | None:
