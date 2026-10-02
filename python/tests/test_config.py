@@ -213,6 +213,59 @@ def test_the_watcher_spends_the_stored_key(keychain: dict, spender: None) -> Non
     assert resolve_api_key() == "sk-the-watchers-key"
 
 
+# ---- the watcher's fallback when there is no keychain ----------------------
+
+
+def _write_env_file(text: str):
+    path = config.watcher_env_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_watcher_falls_back_to_its_env_file(no_keychain: None, spender: None) -> None:
+    # KeePassXC not running, a headless box: `login` has nowhere to put the key,
+    # and a service inherits no shell, so this file is how it is handed one.
+    _write_env_file("OPENAI_API_KEY=sk-from-the-file\n")
+    assert resolve_api_key() == "sk-from-the-file"
+
+
+def test_the_keychain_still_wins_over_the_env_file(keychain: dict, spender: None) -> None:
+    _write_env_file("OPENAI_API_KEY=sk-from-the-file\n")
+    config.store_api_key("sk-the-watchers-key")
+    assert resolve_api_key() == "sk-the-watchers-key"
+
+
+def test_a_command_run_by_hand_does_not_spend_the_env_file(no_keychain: None) -> None:
+    # The file is the watcher's credential, the same as the keychain entry it
+    # stands in for, so the spender rule covers it too.
+    _write_env_file("OPENAI_API_KEY=sk-from-the-file\n")
+    with pytest.raises(ConfigError, match="which is what spends it"):
+        resolve_api_key()
+
+
+def test_the_env_file_leaks_nothing_into_the_environment(
+    no_keychain: None, spender: None
+) -> None:
+    import os
+
+    _write_env_file("OPENAI_API_KEY=sk-from-the-file\nSYP_LLM_MODEL=other\n")
+    resolve_api_key()
+    assert "SYP_LLM_MODEL" not in os.environ
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_no_keychain_to_store_in_names_the_env_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Exploding:
+        @staticmethod
+        def set_password(service, user, value):
+            raise RuntimeError("no backend")
+
+    monkeypatch.setitem(__import__("sys").modules, "keyring", Exploding)
+    with pytest.raises(ConfigError, match=str(config.watcher_env_path())):
+        config.store_api_key("sk-x")
+
+
 def test_a_client_never_reads_the_keychain_at_all(monkeypatch) -> None:
     """Not even to write a better error message.
 

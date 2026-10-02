@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 # Mirrors the Rust defaults so the two pipelines read the same folder the same way.
 DEFAULT_OUTPUT_DIR = "sorted"
@@ -204,6 +204,9 @@ def resolve_api_key() -> str:
     The environment still works and is still what a container or a CI job uses,
     so nothing that worked before stops working.
 
+    Last, and in the watcher only, `watcher_env_path`: the key for a session
+    with no keychain to keep it in.
+
     ``OEPNAI_API_KEY`` is accepted because the repository's own ``.env`` spells
     it that way; the correct spelling wins when both are set.
     """
@@ -216,6 +219,10 @@ def resolve_api_key() -> str:
         value = (os.getenv(name) or "").strip()
         if value:
             return value
+    if _MAY_USE_KEYCHAIN:
+        fallback = key_from_env_file()
+        if fallback:
+            return fallback
     if not _MAY_USE_KEYCHAIN:
         # Deliberately without asking the keychain whether it holds one. Reading
         # it is what makes a locked keyring prompt, and a command that cannot
@@ -229,8 +236,40 @@ def resolve_api_key() -> str:
         )
     raise ConfigError(
         "no API key found; run `sypy login` so the watcher has one, "
-        "or set OPENAI_API_KEY in the environment or in .env"
+        f"or put OPENAI_API_KEY=... in {watcher_env_path()} for a machine "
+        "with no keychain"
     )
+
+
+def watcher_env_path() -> Path:
+    """The file the watcher falls back to when there is no keychain to read.
+
+    Beside the watch registry, because both belong to the person rather than to
+    the checkout. It exists for the session the keychain is absent from -- a
+    KeePassXC that is not running, a headless box -- where `login` has nowhere
+    to put the key and the service, inheriting no shell, has no other way to
+    be handed one.
+    """
+    from .registry import registry_path
+
+    return registry_path().parent / "env"
+
+
+def key_from_env_file() -> str | None:
+    """The key in `watcher_env_path`, or None when there is no such file or key.
+
+    Read with `dotenv_values` rather than loaded, so the file answers for the
+    key and nothing else in it leaks into the process environment.
+    """
+    path = watcher_env_path()
+    if not path.is_file():
+        return None
+    values = dotenv_values(path)
+    for name in ("OPENAI_API_KEY", "SYP_API_KEY"):
+        value = (values.get(name) or "").strip()
+        if value:
+            return value
+    return None
 
 
 def key_from_keychain() -> str | None:
@@ -300,7 +339,10 @@ def store_api_key(key: str) -> None:
 
         keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, key)
     except Exception as exc:
-        raise ConfigError(f"no keychain available to store the key: {exc}") from exc
+        raise ConfigError(
+            f"no keychain available to store the key: {exc}. Without one, the "
+            f"watcher reads OPENAI_API_KEY from {watcher_env_path()} instead"
+        ) from exc
     _key_changed()
 
 
