@@ -622,6 +622,27 @@ it was filed, how large it is, how many pages were read, and its attributes.
 read an answer out of, so "the three most recent" is not a question the library
 could be asked.
 
+`sortyourpaperya search` answers the other question — what a document *says* —
+and answers it by meaning, so "learning from reward" finds the paper that only
+ever says "reinforcement". It looks through the text of every document and every
+note beside one, and shows each document's closest passage with its page (or the
+note it is in).
+
+```bash
+sortyourpaperya index                                  # once, to embed what is already filed
+sortyourpaperya search "prediction error in dopamine" --json
+```
+
+Text is cut into overlapping chunks of about 200 words and embedded with the
+OpenAI embeddings API (`text-embedding-3-small`; `SYP_EMBEDDING_MODEL` changes
+it). The vectors live in the library's DuckDB beside everything else and are
+compared in full on each search — no extension, no second store, a few
+milliseconds for a library of tens of thousands of chunks. A document is
+embedded once per content and a note once per edit, so `index` over an unchanged
+library sends nothing, and the watcher runs it after every pass that filed
+something. Each request counts against the daily budget like any other. Notes
+edited between filings are picked up by the next pass, or by `index` now.
+
 `sortyourpaperya categories` lists every category path in use with a count under each. It
 is what a re-tag should be decided from, and the alternative was listing the
 whole library and grouping it by hand.
@@ -748,6 +769,8 @@ sortyourpaperya list                              # what the library holds
 sortyourpaperya list --json                       # ...as records, for a program to read
 sortyourpaperya list --sort recent                # id (default), recent, updated, title, year, size
 sortyourpaperya find "attention 2017"             # by title, author, keyword, tag, year, or id
+sortyourpaperya search "learning from reward"     # by meaning, in the text and the notes
+sortyourpaperya index                             # embed what changed, for search
 sortyourpaperya categories                        # every category in use, and how many are under it
 sortyourpaperya read <id>                         # the document's text, on stdout
 sortyourpaperya read <id> --pages 1-5             # ...a range of it
@@ -1082,7 +1105,7 @@ Three routes, by what a command needs:
 |---|---|---|
 | **read** — `find` `list` `categories` `sql` `cited` `read` | direct, read-only; the watcher answers only while a pass holds the lock | direct |
 | **change** — `attr` `remove` `retag` `fsck` `scan` `tree` `migrate-store` `cache` `backup` | the watcher makes the change | in-process, waiting for the lock as before |
-| **spend** — `ingest` | the watcher files it, with its key | refused unless `OPENAI_API_KEY` is set for the run |
+| **spend** — `ingest` `index` `search` | the watcher does it, with its key | refused unless `OPENAI_API_KEY` is set for the run |
 
 **Reads deliberately do not go through the watcher.** Several read-only
 connections coexist, so a question about the library is answered whether or not

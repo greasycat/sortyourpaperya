@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -22,6 +23,9 @@ from .library import FilingMode, Library, PlannedFiling
 from .llm import LlmClient
 from .notify import notify
 from .watchlock import claim as claim_folders
+
+if TYPE_CHECKING:
+    from .semantic import Embedder
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +62,7 @@ async def watch(
     *,
     mode: FilingMode = FilingMode.PREVIEW,
     max_passes: int | None = None,
+    embedder: "Embedder | None" = None,
 ) -> list[IngestReport]:
     """Ingest the input folder whenever new PDFs settle in it.
 
@@ -68,6 +73,9 @@ async def watch(
     Args:
         max_passes: stop after this many ingest passes. For tests; ``None``
             runs forever.
+        embedder: when given, a pass that filed something is followed by an
+            index pass, so what was just filed -- and any note edited since the
+            last one -- is searchable without anyone asking for it.
     """
     if not settings.input_dir.is_dir():
         raise NotADirectoryError(
@@ -175,6 +183,8 @@ async def watch(
                     path.name,
                     settings.max_file_size_mb,
                 )
+            if embedder is not None and report.filed:
+                await _index(server, library, embedder)
     finally:
         observer.stop()
         observer.join(timeout=5)
@@ -184,6 +194,31 @@ async def watch(
         claim.release()
 
     return reports
+
+
+async def _index(server: Server, library: Library, embedder: "Embedder") -> None:
+    """Make what a pass filed searchable. Never fatal to the watcher.
+
+    Under the same lock as a pass, since it writes. A failure -- no key, a spent
+    budget, a request that would not go -- is logged and waits for the next
+    pass, or for `sypy index`; what was filed stays filed either way.
+    """
+    from .semantic import index_library
+
+    try:
+        async with server.busy:
+            report = await index_library(library, embedder)
+    except Exception as err:
+        log.error("indexing for search failed: %s", err)
+        return
+    if report.indexed:
+        log.info(
+            "indexed %d source(s) for search, %d chunk(s)",
+            len(report.indexed),
+            report.chunks,
+        )
+    for label, reason in report.failed:
+        log.warning("could not index %s: %s", label, reason)
 
 
 def _category(library: Library, filing: PlannedFiling) -> str:

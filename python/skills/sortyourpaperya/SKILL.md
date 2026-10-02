@@ -24,6 +24,19 @@ tag, author, or keyword — so adding a word narrows and removing one widens. If
 a search comes back empty, drop the most specific word and try again rather
 than concluding the library does not have it.
 
+`find` matches what a document is described *by*, not what it says. For a
+question about content — "the paper that argues X", "where did I note Y" — use
+search, which matches by meaning against the text and the notes and shows the
+passage and page it matched:
+
+```bash
+sortyourpaperya search "dopamine as a prediction error" --json
+```
+
+A result there is a lead, not a citation: read the page it names before quoting
+it. If search says documents are not indexed yet, `sortyourpaperya index` embeds them
+(it costs requests, so mention it rather than running it unasked).
+
 Twenty results are shown by default. When more matched, `find` says so on
 stderr — read it, because the rest are documents the library holds and this
 search did not show you. Add a word to narrow, or pass `--limit 0` for all of

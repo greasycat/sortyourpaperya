@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from datetime import datetime, timezone
@@ -45,7 +46,7 @@ import subprocess
 
 from .library import FilingMode, Library, LibraryError
 from .llm import LazyOpenAiClient, LlmError, OpenAiClient
-from . import recategorize
+from . import protocol, recategorize, semantic
 from .naming import split_category
 from .registry import RegistryError, WatchEntry, load_registry, registry_path
 from .watch import watch as watch_loop
@@ -311,7 +312,15 @@ def watch(
     )
     try:
         with Library(settings.output_dir) as library:
-            asyncio.run(watch_loop(settings, client, library, mode=mode))
+            asyncio.run(
+                watch_loop(
+                    settings,
+                    client,
+                    library,
+                    mode=mode,
+                    embedder=semantic.LazyOpenAiEmbedder(),
+                )
+            )
     except WatchConflict as err:
         typer.echo(f"error: {err}", err=True)
         typer.echo(
@@ -1903,6 +1912,127 @@ def find(
                 "or pass --limit 0 for all of them",
                 err=True,
             )
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="What you are looking for, in your own words."),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    limit: int = typer.Option(10, "--limit", "-n", min=1, help="Most documents to show."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print records instead of a table, for a program to read."
+    ),
+) -> None:
+    """Find documents by what they and their notes say, matched by meaning.
+
+    Where `find` matches words against titles, authors, and tags, this compares
+    the query with the text inside each document and each of its notes, so it
+    finds a paper that never uses the query's words. Each document shows the
+    passage that came closest, and the page it is on.
+
+    Only what `sypy index` -- or the watcher, after each filing -- has embedded
+    is searched. Embedding the query is one small request on the watcher's key,
+    or on OPENAI_API_KEY when no watcher is running.
+    """
+    from . import client as _client
+
+    root = _resolved_library(library_dir)
+    unindexed = None
+    try:
+        if root is not None and _client.serving(root):
+            hits = protocol.load(
+                _client.call(root, "search", {"query": query, "limit": limit})
+            )
+        else:
+            settings = _settings(None, library_dir)
+            embedder = _local_embedder()
+            with _reading(settings.output_dir) as library:
+                hits = asyncio.run(semantic.search(library, embedder, query, limit))
+                try:
+                    unindexed = library.db.unindexed_count(embedder.model)
+                except Exception:
+                    # A library no writer has migrated has no index to count.
+                    unindexed = None
+    except (ConfigError, RuntimeError) as err:
+        # A spent budget, a refused key, a request that would not go: each is
+        # its own line rather than a traceback.
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    if as_json:
+        typer.echo(json.dumps([dataclasses.asdict(hit) for hit in hits], indent=2))
+        return
+    for hit in hits:
+        typer.echo(f"{hit.score:.3f}  {hit.file_id}  {hit.title or ''}")
+        where = hit.source or (f"p. {hit.page}" if hit.page else "text")
+        snippet = " ".join(hit.text.split())
+        if len(snippet) > 200:
+            snippet = snippet[:200] + "…"
+        typer.echo(f"       {where}: {snippet}")
+    if not hits:
+        typer.echo("nothing indexed matched; `sypy index` embeds the library", err=True)
+    if unindexed:
+        typer.echo(
+            f"{unindexed} document(s) are not indexed yet; `sypy index` adds them",
+            err=True,
+        )
+
+
+@app.command()
+def index(
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Embed documents and notes for `sypy search`, where they have changed.
+
+    Only what is new or changed costs anything: a document is embedded once per
+    content, a note once per edit. The watcher runs this after every filing, so
+    by hand it is for the first time, and for notes edited since.
+    """
+    from . import client as _client
+
+    async def progress(line: str) -> None:
+        typer.echo(f"  {line}")
+
+    root = _resolved_library(library_dir)
+    try:
+        if root is not None and _client.serving(root):
+            report = protocol.load(
+                _client.call(
+                    root,
+                    "index",
+                    {},
+                    on_event=lambda frame: typer.echo(f"  {frame.get('input', '')}"),
+                )
+            )
+        else:
+            settings = _settings(None, library_dir)
+            embedder = _local_embedder()
+            with Library(settings.output_dir) as library:
+                report = asyncio.run(
+                    semantic.index_library(library, embedder, progress=progress)
+                )
+    except (ConfigError, RuntimeError) as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    typer.echo(
+        f"indexed {len(report.indexed)} source(s) ({report.chunks} chunk(s)); "
+        f"{report.unchanged} unchanged, {report.removed} removed, "
+        f"{len(report.failed)} failed"
+    )
+    for label, reason in report.failed:
+        typer.echo(f"  could not index {label}: {reason}", err=True)
+    if report.failed:
+        raise typer.Exit(code=1)
+
+
+def _local_embedder() -> "semantic.OpenAiEmbedder":
+    """An embedder for a command run with no watcher, on this shell's key."""
+    try:
+        return semantic.OpenAiEmbedder(resolve_api_key())
+    except ConfigError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=2) from err
 
 
 @app.command()

@@ -210,6 +210,34 @@ async def _login(library: Library, args: dict[str, Any], emit: Emit) -> Any:
     return {"stored": True}
 
 
+@op("index")
+async def _index(library: Library, args: dict[str, Any], emit: Emit) -> Any:
+    """Embed what has changed since the last index, on the watcher's key."""
+    from .semantic import LazyOpenAiEmbedder, index_library
+
+    async def progress(line: str) -> None:
+        await emit(protocol.event("progress", input=line))
+
+    report = await index_library(
+        library, LazyOpenAiEmbedder(), progress=progress
+    )
+    return protocol.dump(report)
+
+
+@op("search")
+async def _search(library: Library, args: dict[str, Any], emit: Emit) -> Any:
+    """Search by meaning. Here because embedding the query spends the key."""
+    from .semantic import LazyOpenAiEmbedder, search
+
+    hits = await search(
+        library,
+        LazyOpenAiEmbedder(),
+        str(args.get("query") or ""),
+        int(args.get("limit") or 10),
+    )
+    return protocol.dump(hits)
+
+
 @op("logout")
 async def _logout(library: Library, args: dict[str, Any], emit: Emit) -> Any:
     """Forget the stored key, from the process that owns the keyring access."""
