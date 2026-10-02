@@ -25,6 +25,7 @@ from .config import (
     MAX_STEERING_CATEGORIES,
     DEFAULT_LABEL_CACHE_DAYS,
     DEFAULT_LLM_MAX_RETRIES,
+    DEFAULT_MAX_FILE_SIZE_MB,
     DEFAULT_LLM_TIMEOUT_SECONDS,
     ConfigError,
     env_float,
@@ -133,6 +134,13 @@ def ingest(
         "--mode",
         help="preview (default), copy to leave the source in place, or move.",
     ),
+    max_file_size_mb: int = typer.Option(
+        None,
+        "--max-file-size-mb",
+        min=0,
+        help="Skip PDFs larger than this; 0 for no limit. "
+        f"Default SYP_MAX_FILE_SIZE_MB, else {DEFAULT_MAX_FILE_SIZE_MB}.",
+    ),
 ) -> None:
     """Read every not-yet-known document and file it into the library.
 
@@ -149,12 +157,15 @@ def ingest(
 
     root = _resolved_library(library_dir)
     if root is not None and _client.serving(root):
-        report = _ingest_via_watcher(_client, root, input_dir, mode, model)
+        report = _ingest_via_watcher(
+            _client, root, input_dir, mode, model, max_file_size_mb
+        )
         _report_ingest(report, mode)
         return
 
     settings, client = _build(
-        input_dir, library_dir, recursive, page_cutoff, batch_size, model
+        input_dir, library_dir, recursive, page_cutoff, batch_size, model,
+        max_file_size_mb=max_file_size_mb,
     )
     with Library(settings.output_dir) as library:
         report = asyncio.run(ingest_folder(settings, client, library, mode=mode))
@@ -164,7 +175,9 @@ def ingest(
         raise typer.Exit(code=1)
 
 
-def _ingest_via_watcher(client_mod, root: Path, input_dir: Path | None, mode, model):
+def _ingest_via_watcher(
+    client_mod, root: Path, input_dir: Path | None, mode, model, max_file_size_mb=None
+):
     """Have the watcher file the folder, printing what it files as it goes.
 
     The pass runs there, so its per-document lines arrive as events rather than
@@ -194,6 +207,7 @@ def _ingest_via_watcher(client_mod, root: Path, input_dir: Path | None, mode, mo
             "input_dir": str(input_dir),
             "mode": mode.value,
             "model": model,
+            "max_file_size_mb": max_file_size_mb,
         },
         on_event=lambda frame: typer.echo(
             f"  {frame.get('event')}: {frame.get('input', '')}".rstrip(": ")
@@ -2206,6 +2220,7 @@ def _build_settings(
     page_cutoff: int | None,
     batch_size: int | None,
     model: str | None,
+    max_file_size_mb: int | None = None,
 ):
     """Settings alone, for a caller that does not want a key resolved yet."""
     try:
@@ -2216,6 +2231,7 @@ def _build_settings(
             page_cutoff=page_cutoff,
             keyword_batch_size=batch_size,
             model=model,
+            max_file_size_mb=max_file_size_mb,
         )
     except ConfigError as err:
         typer.echo(f"error: {err}", err=True)
@@ -2229,8 +2245,11 @@ def _build(
     page_cutoff: int | None,
     batch_size: int | None,
     model: str | None,
+    max_file_size_mb: int | None = None,
 ):
-    settings = _build_settings(input_dir, library_dir, recursive, page_cutoff, batch_size, model)
+    settings = _build_settings(
+        input_dir, library_dir, recursive, page_cutoff, batch_size, model, max_file_size_mb
+    )
     try:
         return settings, OpenAiClient(
             resolve_api_key(),

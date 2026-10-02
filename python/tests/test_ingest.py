@@ -189,6 +189,20 @@ async def test_oversized_files_are_skipped_not_failed(settings: Settings, librar
     assert report.failed == []
 
 
+async def test_a_size_limit_of_zero_files_everything(settings: Settings, library: Library) -> None:
+    import dataclasses
+
+    big = settings.input_dir / "big.pdf"
+    write_pdf(big, "big")
+    big.write_bytes(big.read_bytes() + b"\x00" * (17 * 1024 * 1024))
+
+    unlimited = dataclasses.replace(settings, max_file_size_mb=0)
+    report = await ingest_folder(unlimited, FakeLlmClient(), library, mode=FilingMode.MOVE)
+
+    assert report.skipped_oversized == []
+    assert report.processed == 1
+
+
 async def test_a_failed_batch_does_not_discard_the_batches_that_worked(
     settings: Settings, library: Library
 ) -> None:

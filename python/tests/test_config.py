@@ -381,3 +381,21 @@ def test_the_default_collection_still_wins(monkeypatch) -> None:
 
     assert config.key_from_keychain() == "sk-from-default"
     assert other.read is False  # no need to look further
+
+
+# ---- the size limit ---------------------------------------------------------
+
+
+def test_the_size_limit_comes_from_the_argument_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYP_MAX_FILE_SIZE_MB", "50")
+    assert config.resolve_settings(max_file_size_mb=200).max_file_size_bytes == 200 * 1024 * 1024
+    assert config.resolve_settings().max_file_size_mb == 50
+
+
+def test_a_size_limit_of_zero_is_no_limit() -> None:
+    assert config.resolve_settings(max_file_size_mb=0).max_file_size_bytes is None
+
+
+def test_a_negative_size_limit_is_refused() -> None:
+    with pytest.raises(ConfigError, match="max_file_size_mb"):
+        config.resolve_settings(max_file_size_mb=-1)

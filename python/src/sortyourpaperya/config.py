@@ -97,9 +97,23 @@ class Settings:
     model: str = DEFAULT_MODEL
 
     def __post_init__(self) -> None:
-        for name in ("max_file_size_mb", "page_cutoff", "keyword_batch_size"):
+        for name in ("page_cutoff", "keyword_batch_size"):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"{name} must be greater than 0")
+        if self.max_file_size_mb < 0:
+            raise ConfigError("max_file_size_mb must be 0 (no limit) or greater")
+
+    @property
+    def max_file_size_bytes(self) -> int | None:
+        """The size past which a PDF is skipped, or None when there is no limit.
+
+        0 is "no limit", as it is for the spend ceilings: the limit exists to
+        keep a stray scan of a whole book from being read, and someone filing
+        one on purpose should not have to guess a number larger than it.
+        """
+        if self.max_file_size_mb == 0:
+            return None
+        return self.max_file_size_mb * 1024 * 1024
 
 
 def resolve_settings(
@@ -110,6 +124,7 @@ def resolve_settings(
     page_cutoff: int | None = None,
     keyword_batch_size: int | None = None,
     model: str | None = None,
+    max_file_size_mb: int | None = None,
 ) -> Settings:
     """Resolve settings from explicit arguments, then ``SYP_*`` variables, then defaults.
 
@@ -131,7 +146,9 @@ def resolve_settings(
         output_dir=resolved_output,
         recursive=_first_bool(recursive, os.getenv("SYP_RECURSIVE"), False),
         max_file_size_mb=_first_int(
-            None, os.getenv("SYP_MAX_FILE_SIZE_MB"), DEFAULT_MAX_FILE_SIZE_MB
+            max_file_size_mb,
+            os.getenv("SYP_MAX_FILE_SIZE_MB"),
+            DEFAULT_MAX_FILE_SIZE_MB,
         ),
         page_cutoff=_first_int(
             page_cutoff, os.getenv("SYP_PAGE_CUTOFF"), DEFAULT_PAGE_CUTOFF

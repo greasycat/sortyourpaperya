@@ -322,13 +322,13 @@ def _hash_candidates(
     library can say whether it already holds one. Parsing does not, and is far
     slower, so it waits until phase 3 when the known ones have been dropped.
     """
-    max_bytes = settings.max_file_size_mb * 1024 * 1024
+    max_bytes = settings.max_file_size_bytes
     candidates: list[tuple[Path, str]] = []
 
     for candidate in discover_pdfs(settings.input_dir, recursive=settings.recursive):
         if _is_within(candidate.path, library.root):
             continue
-        if candidate.size_bytes > max_bytes:
+        if max_bytes is not None and candidate.size_bytes > max_bytes:
             report.skipped_oversized.append(candidate.path)
             continue
         try:

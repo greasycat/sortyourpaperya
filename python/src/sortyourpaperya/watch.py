@@ -222,7 +222,7 @@ def _pending(settings: Settings, library: Library) -> Snapshot:
         settings.input_dir,
         library.root,
         recursive=settings.recursive,
-        max_file_size_mb=settings.max_file_size_mb,
+        max_file_size_mb=settings.max_file_size_mb or None,
     )
 
 

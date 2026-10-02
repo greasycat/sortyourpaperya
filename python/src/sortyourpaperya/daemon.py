@@ -180,6 +180,7 @@ async def _ingest(library: Library, args: dict[str, Any], emit: Emit) -> Any:
         Path(args["input_dir"]),
         library.root,
         model=args.get("model"),
+        max_file_size_mb=args.get("max_file_size_mb"),
     )
     mode = FilingMode(args.get("mode", FilingMode.PREVIEW.value))
     await emit(protocol.event("started", input=str(settings.input_dir), mode=mode.value))
