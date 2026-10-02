@@ -18,7 +18,7 @@ DEFAULT_OUTPUT_DIR = "sorted"
 DEFAULT_MAX_FILE_SIZE_MB = 16
 DEFAULT_PAGE_CUTOFF = 1
 DEFAULT_KEYWORD_BATCH_SIZE = 20
-DEFAULT_MODEL = "gpt-5.6-terra"
+DEFAULT_MODEL = "gpt-6-luna"
 
 # Text budget per request, matching `MAX_TOTAL_BATCH_TEXT_CHARS` and
 # `MAX_TEXT_CHARS_PER_FILE` in crates/syp-library/src/papers/taxonomy/mod.rs.
