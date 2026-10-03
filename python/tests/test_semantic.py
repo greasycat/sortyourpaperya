@@ -311,3 +311,57 @@ async def test_a_spent_embedding_budget_fails_the_pass_without_recording(
     report = await index_library(library, embedder)
     assert report.indexed == [] and len(report.failed) == 1
     assert library.db.text_fingerprints() == []
+
+
+# ---- progress -------------------------------------------------------------------
+
+
+async def test_progress_counts_up_to_the_sources_that_needed_embedding(
+    settings: Settings, library: Library
+) -> None:
+    await _file(settings, library, a="reward shaping", b="attention heads")
+    note = library.note_path(_paper_with(library, "reward"), "notes")
+    note.write_text("a note")
+    seen: list[tuple[int, int, str]] = []
+
+    async def progress(done: int, total: int, what: str) -> None:
+        seen.append((done, total, what))
+
+    await index_library(library, FakeEmbedder(), progress=progress)
+
+    assert {total for _, total, _ in seen} == {3}
+    dones = [done for done, _, _ in seen]
+    assert dones == sorted(dones) and dones[0] == 0 and dones[-1] == 3
+    assert any(what.startswith("reading notes.md of") for _, _, what in seen)
+    assert any(what.startswith("embedding") for _, _, what in seen)
+    assert seen[-1][2] == "done"
+
+
+async def test_an_unchanged_library_reports_nothing_to_do(
+    settings: Settings, library: Library
+) -> None:
+    await _file(settings, library, a="reward shaping")
+    await index_library(library, FakeEmbedder())
+    seen: list[tuple[int, int, str]] = []
+
+    async def progress(done: int, total: int, what: str) -> None:
+        seen.append((done, total, what))
+
+    await index_library(library, FakeEmbedder(), progress=progress)
+    assert {total for _, total, _ in seen} == {0}
+
+
+def test_the_index_command_prints_its_summary(
+    settings: Settings, library: Library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from sortyourpaperya.cli import app
+
+    asyncio.run(_file(settings, library, a="reward shaping"))
+    library.release()
+    monkeypatch.setattr("sortyourpaperya.cli._local_embedder", lambda: FakeEmbedder())
+
+    result = CliRunner().invoke(app, ["index", "--library", str(library.root)])
+    assert result.exit_code == 0, result.output
+    assert "indexed 1 source(s)" in result.output

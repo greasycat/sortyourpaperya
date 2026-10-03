@@ -244,7 +244,10 @@ class LazyOpenAiEmbedder:
 
 # ---- indexing ---------------------------------------------------------------
 
-Progress = Callable[[str], Awaitable[None]]
+# `(done, total, what)`: sources handled out of those that need embedding, and a
+# few words on what is happening now. Numbers rather than a line so a caller can
+# draw a bar -- and so the same three fields cross the watcher's socket as-is.
+Progress = Callable[[int, int, str], Awaitable[None]]
 
 
 @dataclass
@@ -328,9 +331,18 @@ async def index_library(
     report.removed = len(vanished)
     library.release()
 
+    total = len(stale)
+
+    async def tell(done: int, what: str) -> None:
+        if progress is not None:
+            await progress(done, total, what)
+
+    await tell(0, "reading")
     batch: list[_Pending] = []
-    for paper, source, print_, note in stale:
+    for done, (paper, source, print_, note) in enumerate(stale):
         label = f"{paper.file_id}/{source}" if source else paper.file_id
+        name = (paper.title or paper.original_name or paper.file_id)[:48]
+        await tell(done, f"reading {source + ' of ' if source else ''}{name}")
         try:
             if note is None:
                 read = _document_text(library, paper)
@@ -349,11 +361,15 @@ async def index_library(
             continue
         inputs = [f"{heading}\n\n{chunk.text}" if heading else chunk.text for chunk in chunks]
         batch.append(_Pending(paper.file_id, source, print_, chunks, inputs))
-        if sum(len(p.inputs) for p in batch) >= EMBED_BATCH:
-            await _flush(library, embedder, batch, report, progress)
+        waiting = sum(len(p.inputs) for p in batch)
+        if waiting >= EMBED_BATCH:
+            await tell(done + 1, f"embedding {waiting} chunk(s)")
+            await _flush(library, embedder, batch, report)
             batch = []
     if batch:
-        await _flush(library, embedder, batch, report, progress)
+        await tell(total, f"embedding {sum(len(p.inputs) for p in batch)} chunk(s)")
+        await _flush(library, embedder, batch, report)
+    await tell(total, "done")
     return report
 
 
@@ -362,7 +378,6 @@ async def _flush(
     embedder: Embedder,
     batch: list[_Pending],
     report: IndexReport,
-    progress: Progress | None,
 ) -> None:
     """Embed a batch of sources together, then write them in one burst.
 
@@ -390,8 +405,6 @@ async def _flush(
         report.indexed.append(_label(pending))
         report.chunks += len(pending.chunks)
     library.release()
-    if progress is not None:
-        await progress(f"embedded {len(report.indexed)} source(s), {report.chunks} chunk(s)")
 
 
 def _label(pending: _Pending) -> str:

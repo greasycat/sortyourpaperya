@@ -1990,27 +1990,31 @@ def index(
     """
     from . import client as _client
 
-    async def progress(line: str) -> None:
-        typer.echo(f"  {line}")
-
     root = _resolved_library(library_dir)
     try:
-        if root is not None and _client.serving(root):
-            report = protocol.load(
-                _client.call(
-                    root,
-                    "index",
-                    {},
-                    on_event=lambda frame: typer.echo(f"  {frame.get('input', '')}"),
+        with _index_bar() as show:
+
+            async def progress(done: int, total: int, what: str) -> None:
+                show(done, total, what)
+
+            if root is not None and _client.serving(root):
+                report = protocol.load(
+                    _client.call(
+                        root,
+                        "index",
+                        {},
+                        on_event=lambda frame: show(
+                            frame.get("done", 0), frame.get("total", 0), frame.get("what", "")
+                        ),
+                    )
                 )
-            )
-        else:
-            settings = _settings(None, library_dir)
-            embedder = _local_embedder()
-            with Library(settings.output_dir) as library:
-                report = asyncio.run(
-                    semantic.index_library(library, embedder, progress=progress)
-                )
+            else:
+                settings = _settings(None, library_dir)
+                embedder = _local_embedder()
+                with Library(settings.output_dir) as library:
+                    report = asyncio.run(
+                        semantic.index_library(library, embedder, progress=progress)
+                    )
     except (ConfigError, RuntimeError) as err:
         typer.echo(f"error: {err}", err=True)
         raise typer.Exit(code=1) from err
@@ -2024,6 +2028,52 @@ def index(
         typer.echo(f"  could not index {label}: {reason}", err=True)
     if report.failed:
         raise typer.Exit(code=1)
+
+
+@contextlib.contextmanager
+def _index_bar():
+    """A progress bar on stderr, and the function that moves it.
+
+    Stderr, so stdout keeps only the summary a script would read. Off a
+    terminal rich draws nothing live, so a log gets the summary and no bar.
+    The bar is not created until there is a total to show: an unchanged library
+    has nothing to embed, and a bar that sits at 0/0 says something is wrong.
+    """
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
+    bar = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]indexing"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn("eta"),
+        TimeRemainingColumn(),
+        TextColumn("{task.description}", style="dim"),
+        console=Console(stderr=True),
+        transient=True,
+    )
+    task = None
+
+    def show(done: int, total: int, what: str) -> None:
+        nonlocal task
+        if not total:
+            return
+        if task is None:
+            task = bar.add_task(what, total=total)
+        bar.update(task, completed=done, total=total, description=what)
+
+    with bar:
+        yield show
 
 
 def _local_embedder() -> "semantic.OpenAiEmbedder":

@@ -215,8 +215,8 @@ async def _index(library: Library, args: dict[str, Any], emit: Emit) -> Any:
     """Embed what has changed since the last index, on the watcher's key."""
     from .semantic import LazyOpenAiEmbedder, index_library
 
-    async def progress(line: str) -> None:
-        await emit(protocol.event("progress", input=line))
+    async def progress(done: int, total: int, what: str) -> None:
+        await emit(protocol.event("progress", done=done, total=total, what=what))
 
     report = await index_library(
         library, LazyOpenAiEmbedder(), progress=progress
