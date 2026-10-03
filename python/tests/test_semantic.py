@@ -365,3 +365,98 @@ def test_the_index_command_prints_its_summary(
     result = CliRunner().invoke(app, ["index", "--library", str(library.root)])
     assert result.exit_code == 0, result.output
     assert "indexed 1 source(s)" in result.output
+
+
+# ---- review fixes ---------------------------------------------------------------
+
+
+async def test_the_watcher_answers_while_an_index_pass_is_embedding(
+    settings: Settings, library: Library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first index is minutes of requests; `status` must not wait them out."""
+    import asyncio
+    import shutil
+    import tempfile
+
+    from sortyourpaperya import client, daemon
+    from sortyourpaperya.watch import _index
+
+    short = tempfile.mkdtemp(prefix="sypyt-")
+    monkeypatch.setenv("SORTYOURPAPERYA_RUNTIME_DIR", short)
+    await _file(settings, library, a="reward shaping")
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class Gated(FakeEmbedder):
+        async def embed(self, texts):
+            started.set()
+            await release.wait()
+            return await super().embed(texts)
+
+    server = daemon.Server(library)
+    await server.start()
+    try:
+        indexing = asyncio.create_task(_index(server, library, Gated()))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        answer = await asyncio.wait_for(client.call_async(library.root, "ping"), timeout=2)
+        assert answer["library"] == str(library.root)
+        release.set()
+        await asyncio.wait_for(indexing, timeout=5)
+        assert len(library.db.text_fingerprints()) == 1
+    finally:
+        release.set()
+        await server.stop()
+        shutil.rmtree(short, ignore_errors=True)
+
+
+def test_requests_are_split_by_size_as_well_as_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(semantic, "EMBED_BATCH_CHARS", 10)
+    assert semantic._requests(["aaaa", "bbbb", "cccc", "d"]) == [["aaaa", "bbbb"], ["cccc", "d"]]
+    # One input larger than the cap still goes, alone.
+    assert semantic._requests(["x" * 50, "y"]) == [["x" * 50], ["y"]]
+
+
+async def test_a_source_the_api_refuses_fails_alone(
+    settings: Settings, library: Library
+) -> None:
+    await _file(settings, library, a="reward shaping", b="poison text here")
+
+    class Picky(FakeEmbedder):
+        async def embed(self, texts):
+            if any("poison" in text for text in texts):
+                raise LlmError("embedding request failed: too many tokens")
+            return await super().embed(texts)
+
+    report = await index_library(library, Picky())
+    assert report.indexed == [_paper_with(library, "reward").file_id]
+    assert [label for label, _ in report.failed] == [_paper_with(library, "poison").file_id]
+
+
+def test_a_spent_embedding_budget_names_its_own_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sortyourpaperya.budget import BudgetExceeded
+
+    monkeypatch.setenv("SYP_MAX_EMBEDDING_TOKENS_PER_DAY", "1")
+    budget = semantic.embedding_budget()
+    budget.record(requests=0, tokens=5)
+    with pytest.raises(BudgetExceeded, match="SYP_MAX_EMBEDDING_TOKENS_PER_DAY"):
+        budget.check("embedding")
+
+
+async def test_a_note_that_cannot_be_read_just_now_keeps_its_chunks(
+    settings: Settings, library: Library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _file(settings, library, a="reward shaping")
+    paper = _paper_with(library, "reward")
+    library.note_path(paper, "notes").write_text("dopamine thoughts")
+    await index_library(library, FakeEmbedder())
+
+    def unreadable(path):
+        raise PermissionError("mid-save")
+
+    monkeypatch.setattr(semantic, "_note_identity", unreadable)
+    report = await index_library(library, FakeEmbedder())
+    assert report.removed == 0 and len(report.failed) == 1
+    assert (paper.file_id, "notes.md") in {(f, s) for f, s, _ in library.db.text_fingerprints()}

@@ -199,15 +199,17 @@ async def watch(
 async def _index(server: Server, library: Library, embedder: "Embedder") -> None:
     """Make what a pass filed searchable. Never fatal to the watcher.
 
-    Under the same lock as a pass, since it writes. A failure -- no key, a spent
-    budget, a request that would not go -- is logged and waits for the next
-    pass, or for `sypy index`; what was filed stays filed either way.
+    Takes the op lock only around its writes, not through the requests -- see
+    `index_library` -- so the socket keeps answering during a long backfill. A
+    failure -- no key, a spent budget, a request that would not go -- is logged
+    and waits for the next pass, or for `sypy index`; what was filed stays filed
+    either way.
     """
     from .semantic import index_library
 
     try:
-        async with server.busy:
-            report = await index_library(library, embedder)
+        async with server.indexing:
+            report = await index_library(library, embedder, exclusive=server.busy)
     except Exception as err:
         log.error("indexing for search failed: %s", err)
         return

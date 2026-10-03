@@ -84,9 +84,18 @@ def ledger_path() -> Path:
 class Budget:
     """The rolling-day ledger, and the ceilings it is checked against."""
 
-    def __init__(self, path: Path | None = None, limits: Limits | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        limits: Limits | None = None,
+        *,
+        token_setting: str = "SYP_MAX_TOKENS_PER_DAY",
+    ) -> None:
         self.path = path or ledger_path()
         self.limits = limits if limits is not None else resolve_limits()
+        # The variable that sets this ledger's token ceiling, so the refusal
+        # names the one that would lift it -- the embedding ledger has its own.
+        self.token_setting = token_setting
 
     def check(self, what: str = "request") -> None:
         """Refuse a request that would start past the ceiling.
@@ -110,7 +119,7 @@ class Budget:
             raise BudgetExceeded(
                 f"the last 24 hours have used {used.tokens} of "
                 f"{self.limits.tokens_per_day} allowed tokens, so this {what} "
-                "was not sent. Raise SYP_MAX_TOKENS_PER_DAY, or wait for the "
+                f"was not sent. Raise {self.token_setting}, or wait for the "
                 "window to move."
             )
 

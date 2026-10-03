@@ -18,6 +18,8 @@ what lets the watcher run one after every filing without anyone paying for it.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -53,9 +55,15 @@ CHUNK_MAX_CHARS = 2000
 # Bumped when the chunking above changes, so every source is cut again.
 CHUNKER_VERSION = 1
 
-# Inputs per embeddings request. The API takes 2048; requests are what the daily
-# budget counts, so fewer and fuller ones keep a backfill from spending it.
+# Inputs per embeddings request. The API takes 2048; fewer, fuller requests
+# make a backfill quicker.
 EMBED_BATCH = 256
+# And characters per request, because the API also refuses a request over ~300k
+# tokens in total. Characters stand in for tokens since no tokenizer is to hand,
+# and a token is almost never shorter than a character -- so this holds for
+# text that runs a token per character, CJK or base64, where counting inputs
+# alone let 256 two-thousand-character chunks ask for ~600k tokens at once.
+EMBED_BATCH_CHARS = 250_000
 
 # The document's own text, as a source. Notes are named by their filename.
 DOCUMENT = ""
@@ -84,6 +92,7 @@ def embedding_budget() -> Budget:
                 "SYP_MAX_EMBEDDING_TOKENS_PER_DAY", DEFAULT_MAX_EMBEDDING_TOKENS_PER_DAY
             ),
         ),
+        token_setting="SYP_MAX_EMBEDDING_TOKENS_PER_DAY",
     )
 
 
@@ -194,8 +203,7 @@ class OpenAiEmbedder:
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
-        for start in range(0, len(texts), EMBED_BATCH):
-            batch = list(texts[start : start + EMBED_BATCH])
+        for batch in _requests(texts):
             self._budget.check(f"embedding {len(batch)} chunk(s)")
             self._budget.record(requests=1)
             try:
@@ -211,6 +219,22 @@ class OpenAiEmbedder:
             # vectors are matched back to their chunks by position.
             vectors.extend(item.embedding for item in sorted(response.data, key=lambda d: d.index))
         return vectors
+
+
+def _requests(texts: Sequence[str]) -> list[list[str]]:
+    """`texts` split into requests within `EMBED_BATCH` and `EMBED_BATCH_CHARS`."""
+    requests: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for text in texts:
+        if current and (len(current) >= EMBED_BATCH or size + len(text) > EMBED_BATCH_CHARS):
+            requests.append(current)
+            current, size = [], 0
+        current.append(text)
+        size += len(text)
+    if current:
+        requests.append(current)
+    return requests
 
 
 class LazyOpenAiEmbedder:
@@ -293,6 +317,7 @@ async def index_library(
     embedder: Embedder,
     *,
     progress: Progress | None = None,
+    exclusive: asyncio.Lock | None = None,
 ) -> IndexReport:
     """Embed every source whose fingerprint has changed, and drop vanished ones.
 
@@ -300,12 +325,19 @@ async def index_library(
     is written in one short burst -- the same shape as an ingest pass, for the
     same reason: a watcher that held the lock through minutes of requests would
     shut every other command out for all of them.
+
+    `exclusive` is the watcher's op lock, and it is held only for those bursts.
+    Held for the whole pass instead, a first index -- minutes of requests -- had
+    `status`, `doctor`, `search`, and every routed command hanging behind it
+    with no timeout and nothing said.
     """
     report = IndexReport()
     model = embedder.model
-    held = {(f, s): fp for f, s, fp in library.db.text_fingerprints()}
-    papers = library.db.all_papers()
-    library.release()
+
+    async with _held(exclusive):
+        held = {(f, s): fp for f, s, fp in library.db.text_fingerprints()}
+        papers = library.db.all_papers()
+        library.release()
 
     wanted: set[tuple[str, str]] = set()
     stale: list[tuple[Paper, str, str, Path | None]] = []
@@ -314,6 +346,10 @@ async def index_library(
             (DOCUMENT, fingerprint(paper.content_hash, model), None)
         ]
         for note in library.notes(paper):
+            # Wanted before it is read: a note that cannot be read just now --
+            # mid-save, or a permissions slip -- still exists, and must keep the
+            # chunks it has rather than be dropped as gone and paid for again.
+            wanted.add((paper.file_id, note.name))
             try:
                 sources.append((note.name, fingerprint(_note_identity(note), model), note))
             except OSError as err:
@@ -326,16 +362,22 @@ async def index_library(
                 stale.append((paper, source, print_, note))
 
     vanished = [key for key in held if key not in wanted]
-    for file_id, source in vanished:
-        library.db.drop_text_source(file_id, source)
+    if vanished:
+        async with _held(exclusive):
+            for file_id, source in vanished:
+                library.db.drop_text_source(file_id, source)
+            library.release()
     report.removed = len(vanished)
-    library.release()
 
     total = len(stale)
 
     async def tell(done: int, what: str) -> None:
         if progress is not None:
             await progress(done, total, what)
+
+    async def flush(done: int, batch: list[_Pending]) -> None:
+        await tell(done, f"embedding {sum(len(p.inputs) for p in batch)} chunk(s)")
+        await _flush(library, embedder, batch, report, exclusive)
 
     await tell(0, "reading")
     batch: list[_Pending] = []
@@ -361,16 +403,25 @@ async def index_library(
             continue
         inputs = [f"{heading}\n\n{chunk.text}" if heading else chunk.text for chunk in chunks]
         batch.append(_Pending(paper.file_id, source, print_, chunks, inputs))
-        waiting = sum(len(p.inputs) for p in batch)
-        if waiting >= EMBED_BATCH:
-            await tell(done + 1, f"embedding {waiting} chunk(s)")
-            await _flush(library, embedder, batch, report)
+        if (
+            sum(len(p.inputs) for p in batch) >= EMBED_BATCH
+            or sum(len(t) for p in batch for t in p.inputs) >= EMBED_BATCH_CHARS
+        ):
+            await flush(done + 1, batch)
             batch = []
     if batch:
-        await tell(total, f"embedding {sum(len(p.inputs) for p in batch)} chunk(s)")
-        await _flush(library, embedder, batch, report)
+        await flush(total, batch)
     await tell(total, "done")
     return report
+
+
+@contextlib.asynccontextmanager
+async def _held(lock: asyncio.Lock | None):
+    if lock is None:
+        yield
+    else:
+        async with lock:
+            yield
 
 
 async def _flush(
@@ -378,33 +429,53 @@ async def _flush(
     embedder: Embedder,
     batch: list[_Pending],
     report: IndexReport,
+    exclusive: asyncio.Lock | None = None,
 ) -> None:
     """Embed a batch of sources together, then write them in one burst.
 
-    A failed request fails the sources in it and nothing else: they keep their
-    old fingerprint, or none, so the next pass tries them again.
+    A request that fails is tried again one source at a time, so a source the
+    API will not take fails alone. Without that, it failed every unrelated
+    source batched with it -- and since a pass batches in the same order each
+    time, failed them again on every pass after.
+
+    A source that still fails keeps its old fingerprint, or none, so the next
+    pass tries it again. A spent budget is not retried: every one would fail.
     """
     inputs = [text for pending in batch for text in pending.inputs]
     try:
         vectors = await embedder.embed(inputs) if inputs else []
-    except (LlmError, BudgetExceeded) as err:
+    except BudgetExceeded as err:
         for pending in batch:
             report.failed.append((_label(pending), str(err)))
         return
-    cursor = 0
-    for pending in batch:
-        mine = vectors[cursor : cursor + len(pending.chunks)]
-        cursor += len(pending.chunks)
-        library.db.replace_text_chunks(
-            pending.file_id,
-            pending.source,
-            pending.fingerprint,
-            embedder.model,
-            [(c.position, c.page, c.text, v) for c, v in zip(pending.chunks, mine)],
-        )
-        report.indexed.append(_label(pending))
-        report.chunks += len(pending.chunks)
-    library.release()
+    except LlmError as err:
+        if len(batch) == 1:
+            report.failed.append((_label(batch[0]), str(err)))
+            return
+        for pending in batch:
+            await _flush(library, embedder, [pending], report, exclusive)
+        return
+
+    async with _held(exclusive):
+        cursor = 0
+        for pending in batch:
+            mine = vectors[cursor : cursor + len(pending.chunks)]
+            cursor += len(pending.chunks)
+            if library.db.get(pending.file_id) is None:
+                # Removed while its text was being embedded -- the lock is not
+                # held through the request, so a `remove` can land in between.
+                # Writing now would leave chunks with no document to point at.
+                continue
+            library.db.replace_text_chunks(
+                pending.file_id,
+                pending.source,
+                pending.fingerprint,
+                embedder.model,
+                [(c.position, c.page, c.text, v) for c, v in zip(pending.chunks, mine)],
+            )
+            report.indexed.append(_label(pending))
+            report.chunks += len(pending.chunks)
+        library.release()
 
 
 def _label(pending: _Pending) -> str:

@@ -29,10 +29,17 @@ Op = Callable[[Library, dict[str, Any], Emit], Awaitable[Any]]
 
 OPS: dict[str, Op] = {}
 
+# Ops that are not run under `Server.busy`, because they spend most of their time
+# waiting on the network and would hold every other op up for all of it. Each is
+# handed the server and takes the lock itself, around what actually needs it.
+SELF_LOCKING: set[str] = set()
 
-def op(name: str) -> Callable[[Op], Op]:
+
+def op(name: str, *, locks_itself: bool = False) -> Callable[[Op], Op]:
     def register(fn: Op) -> Op:
         OPS[name] = fn
+        if locks_itself:
+            SELF_LOCKING.add(name)
         return fn
 
     return register
@@ -210,23 +217,37 @@ async def _login(library: Library, args: dict[str, Any], emit: Emit) -> Any:
     return {"stored": True}
 
 
-@op("index")
-async def _index(library: Library, args: dict[str, Any], emit: Emit) -> Any:
-    """Embed what has changed since the last index, on the watcher's key."""
+@op("index", locks_itself=True)
+async def _index(
+    library: Library, args: dict[str, Any], emit: Emit, server: "Server"
+) -> Any:
+    """Embed what has changed since the last index, on the watcher's key.
+
+    `busy` only around the writes, so `status` and the rest still answer while
+    minutes of embedding requests go out; `indexing` so two passes -- this and
+    the watch loop's own -- do not both embed the same sources.
+    """
     from .semantic import LazyOpenAiEmbedder, index_library
 
     async def progress(done: int, total: int, what: str) -> None:
         await emit(protocol.event("progress", done=done, total=total, what=what))
 
-    report = await index_library(
-        library, LazyOpenAiEmbedder(), progress=progress
-    )
+    async with server.indexing:
+        report = await index_library(
+            library, LazyOpenAiEmbedder(), progress=progress, exclusive=server.busy
+        )
     return protocol.dump(report)
 
 
-@op("search")
-async def _search(library: Library, args: dict[str, Any], emit: Emit) -> Any:
-    """Search by meaning. Here because embedding the query spends the key."""
+@op("search", locks_itself=True)
+async def _search(
+    library: Library, args: dict[str, Any], emit: Emit, server: "Server"
+) -> Any:
+    """Search by meaning. Here because embedding the query spends the key.
+
+    Reads only, and its one write-free database visit is synchronous, so it
+    cannot interleave with a pass's burst; nothing to lock.
+    """
     from .semantic import LazyOpenAiEmbedder, search
 
     hits = await search(
@@ -283,6 +304,10 @@ class Server:
         # PDF is new and file it twice. That leaves two store folders for one
         # database row, silently. The watch loop's own pass takes this too.
         self.busy = asyncio.Lock()
+        # One index pass at a time. Indexing holds `busy` only for its writes,
+        # so this is what stops the watch loop's pass and a `sypy index` from
+        # both embedding -- and paying for -- the same sources.
+        self.indexing = asyncio.Lock()
 
     async def start(self) -> None:
         """Listen, replacing a socket left behind by a watcher that was killed.
@@ -350,8 +375,15 @@ class Server:
                     writer.write(protocol.encode(payload))
                     await writer.drain()
 
-                async with self.busy:
-                    result = await handler(self.library, frame.get("args") or {}, emit)
+                if name in SELF_LOCKING:
+                    result = await handler(
+                        self.library, frame.get("args") or {}, emit, self
+                    )
+                else:
+                    async with self.busy:
+                        result = await handler(
+                            self.library, frame.get("args") or {}, emit
+                        )
                 reply = protocol.ok(result)
             except Exception as err:
                 log.debug("op failed: %s", err)
