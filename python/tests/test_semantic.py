@@ -682,3 +682,26 @@ def test_a_refused_key_is_not_read_again_on_every_request() -> None:
     for _ in range(5):
         key_refused(refused)
     assert config.key_generation() == before + 1
+
+
+async def test_a_refused_key_is_dropped_by_the_lazy_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lazy clients are the ones holding the cached key, so they drop it."""
+    from sortyourpaperya import config
+
+    class Refused(Exception):
+        status_code = 401
+
+    class Raising:
+        model = "m"
+
+        async def embed(self, texts):
+            raise LlmError("embedding request failed: 401") from Refused()
+
+    monkeypatch.setattr(config, "resolve_api_key", lambda: "sk-old")
+    monkeypatch.setattr(semantic, "OpenAiEmbedder", lambda *a, **k: Raising())
+    before = config.key_generation()
+    with pytest.raises(LlmError):
+        await semantic.LazyOpenAiEmbedder("m").embed(["x"])
+    assert config.key_generation() == before + 1
