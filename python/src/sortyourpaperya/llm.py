@@ -26,6 +26,14 @@ class LlmError(RuntimeError):
     """Raised when the model call fails or its response cannot be used."""
 
 
+def key_refused(err: BaseException) -> None:
+    """Drop the cached key if `err` is the API refusing it; see `forget_cached_key`."""
+    if getattr(err, "status_code", None) == 401:
+        from .config import forget_cached_key
+
+        forget_cached_key()
+
+
 @dataclass(frozen=True)
 class KeywordPair:
     """What the model returns for a single paper.
@@ -459,6 +467,7 @@ class OpenAiClient:
                 },
             )
         except Exception as err:  # surface SDK/transport failures uniformly
+            key_refused(err)
             raise LlmError(f"model request failed: {err}") from err
 
         self._record_tokens(response)
@@ -506,6 +515,7 @@ class OpenAiClient:
                 },
             )
         except Exception as err:  # surface SDK/transport failures uniformly
+            key_refused(err)
             raise LlmError(f"category request failed: {err}") from err
 
         self._record_tokens(response)
@@ -542,6 +552,7 @@ class OpenAiClient:
                 ],
             )
         except Exception as err:  # surface SDK/transport failures uniformly
+            key_refused(err)
             raise LlmError(f"page-reading request failed: {err}") from err
 
         self._record_tokens(response)

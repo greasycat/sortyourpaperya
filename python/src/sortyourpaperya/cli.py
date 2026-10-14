@@ -1666,6 +1666,18 @@ def _doctor_model(ok, bad, warn, *, offline: bool) -> None:
             else:
                 ok(f"spend today {amount}/{ceiling} {noun}")
 
+    # Embedding's own ledger: spent, it fails `index` and `search` while the
+    # chat ceiling above still reads healthy.
+    embedding = semantic.embedding_budget()
+    amount, ceiling = embedding.usage().tokens, embedding.limits.tokens_per_day
+    if ceiling > 0 and amount >= ceiling:
+        bad(
+            f"the day's embedding tokens ceiling is spent ({amount}/{ceiling})",
+            "wait for the window to roll over, or `sypy budget --reset`",
+        )
+    elif ceiling > 0:
+        ok(f"embedding today {amount}/{ceiling} tokens")
+
 
 def _probe_api(key: str) -> str | None:
     """None when the key works, else one line saying why not.
@@ -1759,8 +1771,10 @@ def budget(
 ) -> None:
     """Show what the last 24 hours have cost at the API, against the ceiling."""
     ledger = Budget()
+    embedding = semantic.embedding_budget()
     if reset:
         ledger.reset()
+        embedding.reset()
         typer.echo("spend record cleared")
         return
 
@@ -1769,6 +1783,14 @@ def budget(
     typer.echo(f"last 24 hours, from {ledger.path}")
     typer.echo(f"  requests  {used.requests:>8} / {_ceiling(limits.requests_per_day)}")
     typer.echo(f"  tokens    {used.tokens:>8} / {_ceiling(limits.tokens_per_day)}")
+    # Embedding keeps its own ledger -- see `semantic.embedding_budget` -- and a
+    # spent one stops `index` and `search` with nothing here to say why.
+    embedded = embedding.usage()
+    typer.echo(f"embeddings, from {embedding.path}")
+    typer.echo(f"  requests  {embedded.requests:>8}")
+    typer.echo(
+        f"  tokens    {embedded.tokens:>8} / {_ceiling(embedding.limits.tokens_per_day)}"
+    )
     if limits.unlimited:
         typer.echo(
             "\nboth ceilings are off. The watcher restarts on failure, so "
@@ -2003,8 +2025,12 @@ def index(
                         root,
                         "index",
                         {},
-                        on_event=lambda frame: show(
-                            frame.get("done", 0), frame.get("total", 0), frame.get("what", "")
+                        on_event=lambda frame: (
+                            typer.echo(f"waiting for {frame.get('what', '')}", err=True)
+                            if frame.get("event") == "waiting"
+                            else show(
+                                frame.get("done", 0), frame.get("total", 0), frame.get("what", "")
+                            )
                         ),
                     )
                 )
@@ -2026,7 +2052,11 @@ def index(
     )
     for label, reason in report.failed:
         typer.echo(f"  could not index {label}: {reason}", err=True)
-    if report.failed:
+    if report.stopped:
+        typer.echo(
+            f"stopped early, {report.left} source(s) not tried: {report.stopped}", err=True
+        )
+    if report.failed or report.stopped:
         raise typer.Exit(code=1)
 
 

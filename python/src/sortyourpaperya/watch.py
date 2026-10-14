@@ -8,6 +8,7 @@ coalesced, missed, or caused by the pipeline's own writes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -105,6 +106,7 @@ async def watch(
 
     reports: list[IngestReport] = []
     last_run: Snapshot | None = None
+    indexer = _Indexer(server, library, embedder) if embedder is not None else None
     try:
         while max_passes is None or len(reports) < max_passes:
             pending = _pending(settings, library)
@@ -183,9 +185,13 @@ async def watch(
                     path.name,
                     settings.max_file_size_mb,
                 )
-            if embedder is not None and report.filed:
-                await _index(server, library, embedder)
+            if indexer is not None and report.filed:
+                indexer.request()
+        if indexer is not None:
+            await indexer.drain()
     finally:
+        if indexer is not None:
+            await indexer.stop()
         observer.stop()
         observer.join(timeout=5)
         # The socket goes before the claim: a path that outlived its server
@@ -194,6 +200,48 @@ async def watch(
         claim.release()
 
     return reports
+
+
+class _Indexer:
+    """Index passes run beside the watch loop rather than inside it.
+
+    A first index is minutes to hours of requests, and awaited in the loop it
+    held up filing for all of them: a PDF dropped in during a backfill sat in
+    the inbox until it finished. One pass at a time; a filing that lands while
+    one runs asks for another after it, since the running pass may already
+    have read the library past what was just filed.
+    """
+
+    def __init__(self, server: Server, library: Library, embedder: "Embedder") -> None:
+        self._server = server
+        self._library = library
+        self._embedder = embedder
+        self._task: asyncio.Task[None] | None = None
+        self._again = False
+
+    def request(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._again = True
+            return
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        while True:
+            self._again = False
+            await _index(self._server, self._library, self._embedder)
+            if not self._again:
+                return
+
+    async def drain(self) -> None:
+        """Wait for the pass in flight, for a watcher stopping on its own."""
+        if self._task is not None:
+            await self._task
+
+    async def stop(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
 
 
 async def _index(server: Server, library: Library, embedder: "Embedder") -> None:
@@ -221,6 +269,12 @@ async def _index(server: Server, library: Library, embedder: "Embedder") -> None
         )
     for label, reason in report.failed:
         log.warning("could not index %s: %s", label, reason)
+    if report.stopped:
+        log.warning(
+            "indexing stopped early, %d source(s) left for the next pass: %s",
+            report.left,
+            report.stopped,
+        )
 
 
 def _category(library: Library, filing: PlannedFiling) -> str:

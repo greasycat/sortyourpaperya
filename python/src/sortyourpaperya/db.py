@@ -706,9 +706,10 @@ class PaperDb:
     ) -> None:
         """Swap one source's chunks for these, each `(position, page, text, embedding)`.
 
-        An empty `chunks` is still recorded: a scan nobody has read has no text
-        to embed, and remembering that is what stops every later pass from
-        opening it again to find the same nothing.
+        An empty `chunks` is still recorded: a scan nobody has read, a PDF that
+        will not parse, have no text to embed, and remembering that is what
+        stops every later pass from opening them again to find the same nothing.
+        Their fingerprints say so; see `semantic.UNREADABLE`.
         """
         with self._transaction():
             self._conn.execute(
@@ -750,10 +751,10 @@ class PaperDb:
 
     def nearest_chunks(
         self, embedding: Sequence[float], model: str, limit: int = 10
-    ) -> list[tuple[str, str, int | None, str, float]]:
+    ) -> list[tuple[str, str | None, str, int | None, str, float]]:
         """The best-matching chunk of each of the `limit` closest documents.
 
-        Rows are `(file_id, source, page, text, score)`, score being cosine
+        Rows are `(file_id, title, source, page, text, score)`, score being cosine
         similarity, highest first. One row per document rather than per chunk:
         a long paper is many chunks saying nearly the same thing, and ten hits
         from one book would read as ten answers.
@@ -767,10 +768,11 @@ class PaperDb:
         """
         rows = self._conn.execute(
             """
-            SELECT c.file_id, c.source, c.page, c.text,
-                   list_cosine_similarity(c.embedding, ?::FLOAT[]) AS score
+            SELECT c.file_id, coalesce(p.title, p.original_name), c.source, c.page,
+                   c.text, list_cosine_similarity(c.embedding, ?::FLOAT[]) AS score
             FROM text_chunks c
             JOIN text_sources s ON s.file_id = c.file_id AND s.source = c.source
+            LEFT JOIN papers p ON p.file_id = c.file_id
             WHERE s.model = ?
             QUALIFY row_number() OVER (PARTITION BY c.file_id ORDER BY score DESC) = 1
             ORDER BY score DESC

@@ -232,6 +232,11 @@ async def _index(
     async def progress(done: int, total: int, what: str) -> None:
         await emit(protocol.event("progress", done=done, total=total, what=what))
 
+    if server.indexing.locked():
+        # The watch loop's own pass, or another `index`: this one waits it out,
+        # and says so -- with no total yet, nothing else would be shown, and a
+        # backfill can take long enough for silence to read as a hang.
+        await emit(protocol.event("waiting", what="the index pass already running"))
     async with server.indexing:
         report = await index_library(
             library, LazyOpenAiEmbedder(), progress=progress, exclusive=server.busy

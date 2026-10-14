@@ -35,7 +35,7 @@ from .config import DEFAULT_LLM_MAX_RETRIES, DEFAULT_LLM_TIMEOUT_SECONDS, env_in
 from .db import Paper
 from .extract import ExtractionError
 from .library import Library
-from .llm import LlmError
+from .llm import LlmError, key_refused
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +67,19 @@ EMBED_BATCH_CHARS = 250_000
 
 # The document's own text, as a source. Notes are named by their filename.
 DOCUMENT = ""
+
+# Suffixes on a fingerprint recorded with no chunks, for a source that was looked
+# at and has nothing to embed. Recording it is what stops every pass reopening
+# the same corrupt PDF to fail on it again; each suffix says what would change
+# the answer, and the planning pass looks for exactly that.
+#
+# The file would not parse. Its fingerprint carries its content hash, so a
+# replaced file is a new fingerprint and is tried again by itself.
+UNREADABLE = ":unreadable"
+# The file is not in the store. Tried again once it is back.
+MISSING = ":missing"
+# A scan with no reading of its pages banked yet. Tried again once there is one.
+UNREAD = ":unread"
 
 
 # What embedding may spend in a rolling day. Its own ledger, not the chat one:
@@ -132,6 +145,11 @@ class IndexReport:
     removed: int = 0
     chunks: int = 0
     failed: list[tuple[str, str]] = field(default_factory=list)
+    # Why the pass gave up early -- the network down, the budget spent -- and how
+    # many sources it never got to. Every later request would have failed the
+    # same way, each after its own retries and timeout.
+    stopped: str | None = None
+    left: int = 0
 
 
 # ---- chunking ---------------------------------------------------------------
@@ -162,7 +180,29 @@ def fingerprint(identity: str, model: str) -> str:
     return f"{identity}:{model}:{CHUNKER_VERSION}"
 
 
+def _heading(paper: Paper) -> str:
+    """What every chunk of a document is embedded under: its title."""
+    return paper.title or paper.original_name or ""
+
+
+def _heading_tag(paper: Paper) -> str:
+    """The heading, short, for a fingerprint: a retitled document is re-embedded.
+
+    Each input starts with the title, so the title is part of what a vector
+    means -- one embedded under a title since corrected would keep the old one.
+    """
+    return hashlib.sha256(_heading(paper).encode()).hexdigest()[:8]
+
+
 # ---- the embeddings API -----------------------------------------------------
+
+
+class EmbeddingRejected(LlmError):
+    """The API refused the input itself, so sending it again would not help.
+
+    Distinct from a failure of the request -- the network, a 5xx, a timeout --
+    which says nothing about the input and everything about the next request.
+    """
 
 
 class Embedder(Protocol):
@@ -211,6 +251,9 @@ class OpenAiEmbedder:
                     model=self._model, input=batch
                 )
             except Exception as err:  # surface SDK/transport failures uniformly
+                key_refused(err)
+                if getattr(err, "status_code", None) == 400:
+                    raise EmbeddingRejected(f"embedding request refused: {err}") from err
                 raise LlmError(f"embedding request failed: {err}") from err
             total = getattr(getattr(response, "usage", None), "total_tokens", None)
             if isinstance(total, int) and total > 0:
@@ -285,31 +328,68 @@ class _Pending:
     inputs: list[str]
 
 
-def _document_text(library: Library, paper: Paper) -> tuple[list[str], int | None] | None:
-    """The document's pages and the number of the first, or None if unreadable.
-
-    A scan has no text layer; what the model read off its pages at ingest is
-    used instead, as one block with no page number -- it is one answer covering
-    several pages, not a page each.
-    """
-    path = library.store_path(paper)
+def _read_store(path: Path) -> extract.DocumentText | None:
+    """The document in the store, or None if it is not there. Blocks: a thread's."""
     if not path.is_file():
         return None
-    try:
-        document = extract.read_document(path)
-    except ExtractionError as err:
-        raise LlmError(str(err)) from err
-    if document.has_text_layer:
-        return document.pages, document.first_page
-    banked = library.db.model_answers([paper.content_hash], max_age_ms=None).get(
-        paper.content_hash
-    )
-    text = (banked.page_text or "").strip() if banked else ""
-    return ([text] if text else []), None
+    return extract.read_document(path)
 
 
 def _note_identity(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def _plan(
+    library: Library,
+    papers: list[Paper],
+    held: dict[tuple[str, str], str],
+    model: str,
+    read_since: set[str],
+    report: IndexReport,
+) -> tuple[set[tuple[str, str]], list[tuple[Paper, str, str, Path | None]]]:
+    """Which sources exist, and which of them need embedding. Blocks: a thread's.
+
+    Every note is hashed and every recorded-missing document looked for, which
+    is file I/O across the whole library -- off the watcher's loop, so the
+    socket keeps answering while it happens.
+    """
+    wanted: set[tuple[str, str]] = set()
+    stale: list[tuple[Paper, str, str, Path | None]] = []
+    for paper in papers:
+        tag = _heading_tag(paper)
+        sources: list[tuple[str, str, Path | None]] = [
+            (DOCUMENT, fingerprint(f"{paper.content_hash}.{tag}", model), None)
+        ]
+        for note in library.notes(paper):
+            # Wanted before it is read: a note that cannot be read just now --
+            # mid-save, or a permissions slip -- still exists, and must keep the
+            # chunks it has rather than be dropped as gone and paid for again.
+            wanted.add((paper.file_id, note.name))
+            try:
+                identity = f"{_note_identity(note)}.{tag}"
+                sources.append((note.name, fingerprint(identity, model), note))
+            except OSError as err:
+                report.failed.append((f"{paper.file_id}/{note.name}", str(err)))
+        for source, print_, note in sources:
+            wanted.add((paper.file_id, source))
+            if _settled(library, paper, held.get((paper.file_id, source)), print_, read_since):
+                report.unchanged += 1
+            else:
+                stale.append((paper, source, print_, note))
+    return wanted, stale
+
+
+def _settled(
+    library: Library, paper: Paper, held: str | None, print_: str, read_since: set[str]
+) -> bool:
+    """Whether what is recorded for a source still stands."""
+    if held in (print_, print_ + UNREADABLE):
+        return True
+    if held == print_ + MISSING:
+        return not library.store_path(paper).is_file()
+    if held == print_ + UNREAD:
+        return paper.content_hash not in read_since
+    return False
 
 
 async def index_library(
@@ -329,7 +409,9 @@ async def index_library(
     `exclusive` is the watcher's op lock, and it is held only for those bursts.
     Held for the whole pass instead, a first index -- minutes of requests -- had
     `status`, `doctor`, `search`, and every routed command hanging behind it
-    with no timeout and nothing said.
+    with no timeout and nothing said. Every database visit is under it, since
+    the watcher's own ingest pass shares the connection. File reads -- PDFs
+    parsed, notes hashed -- go to a thread, so they do not stall the loop.
     """
     report = IndexReport()
     model = embedder.model
@@ -337,29 +419,23 @@ async def index_library(
     async with _held(exclusive):
         held = {(f, s): fp for f, s, fp in library.db.text_fingerprints()}
         papers = library.db.all_papers()
+        waiting = [
+            paper.content_hash
+            for paper in papers
+            if held.get((paper.file_id, DOCUMENT), "").endswith(UNREAD)
+        ]
+        read_since = {
+            content_hash
+            for content_hash, answer in library.db.model_answers(
+                waiting, max_age_ms=None
+            ).items()
+            if (answer.page_text or "").strip()
+        }
         library.release()
 
-    wanted: set[tuple[str, str]] = set()
-    stale: list[tuple[Paper, str, str, Path | None]] = []
-    for paper in papers:
-        sources: list[tuple[str, str, Path | None]] = [
-            (DOCUMENT, fingerprint(paper.content_hash, model), None)
-        ]
-        for note in library.notes(paper):
-            # Wanted before it is read: a note that cannot be read just now --
-            # mid-save, or a permissions slip -- still exists, and must keep the
-            # chunks it has rather than be dropped as gone and paid for again.
-            wanted.add((paper.file_id, note.name))
-            try:
-                sources.append((note.name, fingerprint(_note_identity(note), model), note))
-            except OSError as err:
-                report.failed.append((f"{paper.file_id}/{note.name}", str(err)))
-        for source, print_, note in sources:
-            wanted.add((paper.file_id, source))
-            if held.get((paper.file_id, source)) == print_:
-                report.unchanged += 1
-            else:
-                stale.append((paper, source, print_, note))
+    wanted, stale = await asyncio.to_thread(
+        _plan, library, papers, held, model, read_since, report
+    )
 
     vanished = [key for key in held if key not in wanted]
     if vanished:
@@ -375,30 +451,46 @@ async def index_library(
         if progress is not None:
             await progress(done, total, what)
 
-    async def flush(done: int, batch: list[_Pending]) -> None:
+    async def flush(done: int, batch: list[_Pending]) -> str | None:
         await tell(done, f"embedding {sum(len(p.inputs) for p in batch)} chunk(s)")
-        await _flush(library, embedder, batch, report, exclusive)
+        return await _flush(library, embedder, batch, report, exclusive)
 
     await tell(0, "reading")
     batch: list[_Pending] = []
+    stop: str | None = None
     for done, (paper, source, print_, note) in enumerate(stale):
         label = f"{paper.file_id}/{source}" if source else paper.file_id
-        name = (paper.title or paper.original_name or paper.file_id)[:48]
-        await tell(done, f"reading {source + ' of ' if source else ''}{name}")
+        heading = _heading(paper)
+        await tell(done, f"reading {source + ' of ' if source else ''}{heading[:48] or paper.file_id}")
         try:
             if note is None:
-                read = _document_text(library, paper)
-                library.release()
-                if read is None:
+                document = await asyncio.to_thread(_read_store, library.store_path(paper))
+                if document is None:
+                    await _record(library, paper, print_ + MISSING, exclusive)
                     report.failed.append((label, "missing from the store"))
                     continue
-                pages, first = read
-                chunks = chunk_pages(pages, first)
-                heading = paper.title or paper.original_name or ""
+                if document.has_text_layer:
+                    chunks = chunk_pages(document.pages, document.first_page)
+                else:
+                    # A scan has no text layer; what the model read off its
+                    # pages at ingest is used instead, as one block with no page
+                    # number -- one answer covering several pages, not a page each.
+                    text = await _banked_text(library, paper, exclusive)
+                    if not text:
+                        await _record(library, paper, print_ + UNREAD, exclusive)
+                        continue
+                    chunks = chunk_pages([text], None)
             else:
-                chunks = chunk_pages([note.read_text(encoding="utf-8", errors="replace")], None)
-                heading = f"Notes on {paper.title or paper.original_name or ''}"
-        except (LlmError, OSError) as err:
+                text = await asyncio.to_thread(
+                    note.read_text, encoding="utf-8", errors="replace"
+                )
+                chunks = chunk_pages([text], None)
+                heading = f"Notes on {heading}"
+        except ExtractionError as err:
+            await _record(library, paper, print_ + UNREADABLE, exclusive)
+            report.failed.append((label, str(err)))
+            continue
+        except OSError as err:
             report.failed.append((label, str(err)))
             continue
         inputs = [f"{heading}\n\n{chunk.text}" if heading else chunk.text for chunk in chunks]
@@ -407,12 +499,36 @@ async def index_library(
             sum(len(p.inputs) for p in batch) >= EMBED_BATCH
             or sum(len(t) for p in batch for t in p.inputs) >= EMBED_BATCH_CHARS
         ):
-            await flush(done + 1, batch)
+            stop = await flush(done + 1, batch)
             batch = []
-    if batch:
-        await flush(total, batch)
-    await tell(total, "done")
+            if stop is not None:
+                report.left = total - done - 1
+                break
+    if batch and stop is None:
+        stop = await flush(total, batch)
+    report.stopped = stop
+    await tell(total, "stopped" if stop else "done")
     return report
+
+
+async def _banked_text(library: Library, paper: Paper, exclusive: asyncio.Lock | None) -> str:
+    """What the model read off a scan's pages at ingest, or "" if nothing yet."""
+    async with _held(exclusive):
+        banked = library.db.model_answers([paper.content_hash], max_age_ms=None).get(
+            paper.content_hash
+        )
+        library.release()
+    return (banked.page_text or "").strip() if banked else ""
+
+
+async def _record(
+    library: Library, paper: Paper, fingerprint_: str, exclusive: asyncio.Lock | None
+) -> None:
+    """Remember that a document has nothing to embed, and why; see `UNREADABLE`."""
+    async with _held(exclusive):
+        if library.db.get(paper.file_id) is not None:
+            library.db.replace_text_chunks(paper.file_id, DOCUMENT, fingerprint_, "", [])
+        library.release()
 
 
 @contextlib.asynccontextmanager
@@ -430,31 +546,36 @@ async def _flush(
     batch: list[_Pending],
     report: IndexReport,
     exclusive: asyncio.Lock | None = None,
-) -> None:
+) -> str | None:
     """Embed a batch of sources together, then write them in one burst.
 
-    A request that fails is tried again one source at a time, so a source the
-    API will not take fails alone. Without that, it failed every unrelated
-    source batched with it -- and since a pass batches in the same order each
-    time, failed them again on every pass after.
+    A batch the API refuses is tried again one source at a time, so a source it
+    will not take fails alone. Without that, it failed every unrelated source
+    batched with it -- and since a pass batches in the same order each time,
+    failed them again on every pass after.
 
-    A source that still fails keeps its old fingerprint, or none, so the next
-    pass tries it again. A spent budget is not retried: every one would fail.
+    Any other failure -- the network, the service, a spent budget -- is about
+    the request, not the input, so it is not split: 256 more requests would
+    each wait out their retries and timeout to fail the same way. It is
+    returned instead, and the pass stops. A source that fails keeps its old
+    fingerprint, or none, so the next pass tries it again.
     """
     inputs = [text for pending in batch for text in pending.inputs]
     try:
         vectors = await embedder.embed(inputs) if inputs else []
-    except BudgetExceeded as err:
-        for pending in batch:
-            report.failed.append((_label(pending), str(err)))
-        return
-    except LlmError as err:
+    except EmbeddingRejected as err:
         if len(batch) == 1:
             report.failed.append((_label(batch[0]), str(err)))
-            return
-        for pending in batch:
-            await _flush(library, embedder, [pending], report, exclusive)
-        return
+            return None
+        for at, pending in enumerate(batch):
+            stop = await _flush(library, embedder, [pending], report, exclusive)
+            if stop is not None:
+                report.failed.extend((_label(p), stop) for p in batch[at + 1 :])
+                return stop
+        return None
+    except (BudgetExceeded, LlmError) as err:
+        report.failed.extend((_label(pending), str(err)) for pending in batch)
+        return str(err)
 
     async with _held(exclusive):
         cursor = 0
@@ -476,6 +597,7 @@ async def _flush(
             report.indexed.append(_label(pending))
             report.chunks += len(pending.chunks)
         library.release()
+    return None
 
 
 def _label(pending: _Pending) -> str:
@@ -499,17 +621,14 @@ async def search(
         # A library no writer has opened since this was added: nothing is
         # indexed, which is an empty answer rather than an error.
         return []
-    hits = []
-    for file_id, source, page, text, score in rows:
-        paper = library.db.get(file_id)
-        hits.append(
-            SearchHit(
-                file_id=file_id,
-                title=(paper.title or paper.original_name) if paper else None,
-                source=source,
-                page=page,
-                text=text,
-                score=float(score),
-            )
+    return [
+        SearchHit(
+            file_id=file_id,
+            title=title,
+            source=source,
+            page=page,
+            text=text,
+            score=float(score),
         )
-    return hits
+        for file_id, title, source, page, text, score in rows
+    ]

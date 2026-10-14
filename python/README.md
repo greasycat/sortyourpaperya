@@ -79,9 +79,12 @@ sortyourpaperya budget --reset   # start the window over
 Requests and tokens are counted in a rolling 24-hour window, machine-wide rather
 than per-library, in `~/.local/state/sortyourpaperya/spend.json`. A request that would start
 past the ceiling is refused before it is sent, because a limit checked afterwards
-has already been paid. Defaults are 500 requests and 1,000,000 tokens a day;
-raise them with `SYP_MAX_REQUESTS_PER_DAY` and `SYP_MAX_TOKENS_PER_DAY`, or set
-either to `0` to turn that ceiling off.
+has already been paid. The default is 1,000,000 tokens a day and no ceiling on
+requests — tokens are what the bill counts, and they catch a restart loop just
+as well; set `SYP_MAX_TOKENS_PER_DAY` to change it and `SYP_MAX_REQUESTS_PER_DAY`
+to put a request ceiling on too, with `0` turning either off. Embeddings keep
+their own ledger beside it (`embedding-spend.json`, 20,000,000 tokens a day,
+`SYP_MAX_EMBEDDING_TOKENS_PER_DAY`); `budget` shows both and `--reset` clears both.
 
 Each request also has a retry ceiling and a timeout (`SYP_LLM_MAX_RETRIES`,
 default 2; `SYP_LLM_TIMEOUT_SECONDS`, default 120), so one failing or hanging
@@ -640,8 +643,13 @@ compared in full on each search — no extension, no second store, a few
 milliseconds for a library of tens of thousands of chunks. A document is
 embedded once per content and a note once per edit, so `index` over an unchanged
 library sends nothing, and the watcher runs it after every pass that filed
-something. Each request counts against the daily budget like any other. Notes
-edited between filings are picked up by the next pass, or by `index` now.
+something — beside its filing, not in front of it, so a long first index does
+not hold up the inbox. Each request counts against the embedding budget. Notes
+edited between filings are picked up by the next pass, or by `index` now. A
+document that cannot be indexed — a PDF that will not parse, a scan with no
+reading yet, a file missing from the store — is reported once and then left
+alone until that changes. A pass that loses the network or runs out of budget
+stops rather than failing every remaining source one request at a time.
 
 `sortyourpaperya categories` lists every category path in use with a count under each. It
 is what a re-tag should be decided from, and the alternative was listing the

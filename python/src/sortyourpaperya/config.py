@@ -209,6 +209,18 @@ def _key_changed() -> None:
     _CACHED_KEY = (-1, None)
 
 
+def forget_cached_key() -> None:
+    """Read the key afresh next time: the API has just refused this one.
+
+    A key found in the keychain is otherwise believed until `login` or
+    `logout` -- but it can be rotated in the keyring itself, or stored by a
+    `login` that never reached this process, and a watcher holding the old one
+    would fail every request until restarted. A refusal is the one sign that
+    the cached key is wrong, and it costs one keychain read to act on.
+    """
+    _key_changed()
+
+
 # Whether this process may spend the key `login` stored. False everywhere until
 # the watcher says otherwise; see `becomes_the_spender`.
 _MAY_USE_KEYCHAIN = False

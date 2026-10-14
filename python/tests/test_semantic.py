@@ -425,7 +425,7 @@ async def test_a_source_the_api_refuses_fails_alone(
     class Picky(FakeEmbedder):
         async def embed(self, texts):
             if any("poison" in text for text in texts):
-                raise LlmError("embedding request failed: too many tokens")
+                raise semantic.EmbeddingRejected("embedding request refused: too many tokens")
             return await super().embed(texts)
 
     report = await index_library(library, Picky())
@@ -460,3 +460,153 @@ async def test_a_note_that_cannot_be_read_just_now_keeps_its_chunks(
     report = await index_library(library, FakeEmbedder())
     assert report.removed == 0 and len(report.failed) == 1
     assert (paper.file_id, "notes.md") in {(f, s) for f, s, _ in library.db.text_fingerprints()}
+
+
+# ---- second review ----------------------------------------------------------------
+
+
+async def test_the_watcher_keeps_filing_while_it_indexes(
+    settings: Settings, library: Library
+) -> None:
+    """A long index pass runs beside the watch loop, not in front of it."""
+    import asyncio
+
+    from sortyourpaperya.watch import watch
+
+    release = asyncio.Event()
+
+    class Gated(FakeEmbedder):
+        async def embed(self, texts):
+            await release.wait()
+            return await super().embed(texts)
+
+    write_pdf(settings.input_dir / "a.pdf", "reward shaping")
+    watching = asyncio.create_task(
+        watch(
+            settings, FakeLlmClient(), library,
+            mode=FilingMode.MOVE, max_passes=2, embedder=Gated(),
+        )
+    )
+    try:
+        for _ in range(200):
+            if library.db.count() == 1:
+                break
+            await asyncio.sleep(0.05)
+        write_pdf(settings.input_dir / "b.pdf", "dopamine prediction error")
+        for _ in range(200):
+            if library.db.count() == 2:
+                break
+            await asyncio.sleep(0.05)
+        assert library.db.count() == 2, "the second PDF waited for the index pass"
+    finally:
+        release.set()
+        await asyncio.wait_for(watching, timeout=20)
+    assert len(library.db.text_fingerprints()) == 2
+
+
+async def test_a_failed_request_stops_the_pass_instead_of_splitting(
+    settings: Settings, library: Library
+) -> None:
+    """A network failure says nothing about the input; one request per source
+    would each wait out their retries to fail the same way."""
+    await _file(settings, library, a="reward shaping", b="dopamine error")
+    embedder = FakeEmbedder()
+    embedder.fail = True
+    report = await index_library(library, embedder)
+    assert len(embedder.calls) == 1
+    assert report.stopped and len(report.failed) == 2
+    assert library.db.text_fingerprints() == []
+
+
+async def test_an_unreadable_pdf_is_reported_once_then_left_alone(
+    settings: Settings, library: Library
+) -> None:
+    await _file(settings, library, a="reward shaping")
+    (paper,) = library.db.all_papers()
+    library.store_path(paper).write_bytes(b"not a pdf at all")
+    report = await index_library(library, FakeEmbedder())
+    assert [label for label, _ in report.failed] == [paper.file_id]
+
+    report = await index_library(library, FakeEmbedder())
+    assert report.failed == [] and report.unchanged == 1
+
+
+async def test_a_missing_document_is_tried_again_once_it_is_back(
+    settings: Settings, library: Library
+) -> None:
+    await _file(settings, library, a="reward shaping")
+    (paper,) = library.db.all_papers()
+    path = library.store_path(paper)
+    kept = path.read_bytes()
+    path.unlink()
+    report = await index_library(library, FakeEmbedder())
+    assert report.failed == [(paper.file_id, "missing from the store")]
+    report = await index_library(library, FakeEmbedder())
+    assert report.failed == [] and report.unchanged == 1
+
+    path.write_bytes(kept)
+    report = await index_library(library, FakeEmbedder())
+    assert report.indexed == [paper.file_id]
+
+
+async def test_a_scan_is_indexed_once_its_reading_is_banked(
+    settings: Settings, library: Library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sortyourpaperya.db import ModelAnswer
+    from sortyourpaperya.extract import DocumentText
+
+    await _file(settings, library, a="placeholder")
+    (paper,) = library.db.all_papers()
+    monkeypatch.setattr(
+        semantic, "_read_store", lambda path: DocumentText([""], 1, 1)
+    )
+    report = await index_library(library, FakeEmbedder())
+    assert report.indexed == [] and report.failed == []
+    assert (await index_library(library, FakeEmbedder())).unchanged == 1
+
+    library.db.remember_model_answers(
+        [ModelAnswer(content_hash=paper.content_hash, page_text="hippocampal replay")]
+    )
+    report = await index_library(library, FakeEmbedder())
+    assert report.indexed == [paper.file_id]
+    (hit,) = await search(library, FakeEmbedder(), "hippocampal replay")
+    assert hit.file_id == paper.file_id
+
+
+async def test_a_retitled_document_is_embedded_again(
+    settings: Settings, library: Library
+) -> None:
+    import dataclasses
+
+    await _file(settings, library, a="reward shaping")
+    await index_library(library, FakeEmbedder())
+    (paper,) = library.db.all_papers()
+    library.db.upsert(dataclasses.replace(paper, title="A better title"))
+    report = await index_library(library, FakeEmbedder())
+    assert report.indexed == [paper.file_id]
+    (hit,) = await search(library, FakeEmbedder(), "reward shaping")
+    assert hit.title == "A better title"
+
+
+def test_a_refused_key_is_read_again_next_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sortyourpaperya import config
+    from sortyourpaperya.llm import key_refused
+
+    before = config.key_generation()
+    key_refused(type("E", (Exception,), {"status_code": 500})())
+    assert config.key_generation() == before
+    key_refused(type("E", (Exception,), {"status_code": 401})())
+    assert config.key_generation() == before + 1
+
+
+def test_budget_shows_and_resets_the_embedding_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sortyourpaperya.cli import app
+
+    monkeypatch.setenv("SORTYOURPAPERYA_STATE_DIR", str(tmp_path))
+    semantic.embedding_budget().record(requests=1, tokens=1234)
+    result = CliRunner().invoke(app, ["budget"])
+    assert "embeddings" in result.output and "1234" in result.output
+    CliRunner().invoke(app, ["budget", "--reset"])
+    assert semantic.embedding_budget().usage().tokens == 0
