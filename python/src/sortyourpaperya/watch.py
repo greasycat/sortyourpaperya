@@ -8,8 +8,10 @@ coalesced, missed, or caused by the pipeline's own writes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -22,6 +24,9 @@ from .library import FilingMode, Library, PlannedFiling
 from .llm import LlmClient
 from .notify import notify
 from .watchlock import claim as claim_folders
+
+if TYPE_CHECKING:
+    from .semantic import Embedder
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +63,7 @@ async def watch(
     *,
     mode: FilingMode = FilingMode.PREVIEW,
     max_passes: int | None = None,
+    embedder: "Embedder | None" = None,
 ) -> list[IngestReport]:
     """Ingest the input folder whenever new PDFs settle in it.
 
@@ -68,6 +74,9 @@ async def watch(
     Args:
         max_passes: stop after this many ingest passes. For tests; ``None``
             runs forever.
+        embedder: when given, a pass that filed something is followed by an
+            index pass, so what was just filed -- and any note edited since the
+            last one -- is searchable without anyone asking for it.
     """
     if not settings.input_dir.is_dir():
         raise NotADirectoryError(
@@ -97,6 +106,7 @@ async def watch(
 
     reports: list[IngestReport] = []
     last_run: Snapshot | None = None
+    indexer = _Indexer(server, library, embedder) if embedder is not None else None
     try:
         while max_passes is None or len(reports) < max_passes:
             pending = _pending(settings, library)
@@ -175,7 +185,13 @@ async def watch(
                     path.name,
                     settings.max_file_size_mb,
                 )
+            if indexer is not None and report.filed:
+                indexer.request()
+        if indexer is not None:
+            await indexer.drain()
     finally:
+        if indexer is not None:
+            await indexer.stop()
         observer.stop()
         observer.join(timeout=5)
         # The socket goes before the claim: a path that outlived its server
@@ -184,6 +200,81 @@ async def watch(
         claim.release()
 
     return reports
+
+
+class _Indexer:
+    """Index passes run beside the watch loop rather than inside it.
+
+    A first index is minutes to hours of requests, and awaited in the loop it
+    held up filing for all of them: a PDF dropped in during a backfill sat in
+    the inbox until it finished. One pass at a time; a filing that lands while
+    one runs asks for another after it, since the running pass may already
+    have read the library past what was just filed.
+    """
+
+    def __init__(self, server: Server, library: Library, embedder: "Embedder") -> None:
+        self._server = server
+        self._library = library
+        self._embedder = embedder
+        self._task: asyncio.Task[None] | None = None
+        self._again = False
+
+    def request(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._again = True
+            return
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        while True:
+            self._again = False
+            await _index(self._server, self._library, self._embedder)
+            if not self._again:
+                return
+
+    async def drain(self) -> None:
+        """Wait for the pass in flight, for a watcher stopping on its own."""
+        if self._task is not None:
+            await self._task
+
+    async def stop(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+
+
+async def _index(server: Server, library: Library, embedder: "Embedder") -> None:
+    """Make what a pass filed searchable. Never fatal to the watcher.
+
+    Takes the op lock only around its writes, not through the requests -- see
+    `index_library` -- so the socket keeps answering during a long backfill. A
+    failure -- no key, a spent budget, a request that would not go -- is logged
+    and waits for the next pass, or for `sypy index`; what was filed stays filed
+    either way.
+    """
+    from .semantic import index_library
+
+    try:
+        async with server.indexing:
+            report = await index_library(library, embedder, exclusive=server.busy)
+    except Exception as err:
+        log.error("indexing for search failed: %s", err)
+        return
+    if report.indexed:
+        log.info(
+            "indexed %d source(s) for search, %d chunk(s)",
+            len(report.indexed),
+            report.chunks,
+        )
+    for label, reason in report.failed:
+        log.warning("could not index %s: %s", label, reason)
+    if report.stopped:
+        log.warning(
+            "indexing stopped early, %d source(s) left for the next pass: %s",
+            report.left,
+            report.stopped,
+        )
 
 
 def _category(library: Library, filing: PlannedFiling) -> str:
@@ -222,7 +313,7 @@ def _pending(settings: Settings, library: Library) -> Snapshot:
         settings.input_dir,
         library.root,
         recursive=settings.recursive,
-        max_file_size_mb=settings.max_file_size_mb,
+        max_file_size_mb=settings.max_file_size_mb or None,
     )
 
 

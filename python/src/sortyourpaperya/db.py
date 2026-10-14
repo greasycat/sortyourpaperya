@@ -111,6 +111,39 @@ _MIGRATIONS: list[tuple[str, str]] = [
         );
         """,
     ),
+    (
+        # What semantic search reads. A source is one text a document has --
+        # the document itself (`source = ''`) or one of its notes, by filename
+        # -- and `fingerprint` is what it was embedded from, so a source whose
+        # fingerprint still matches is not paid for twice.
+        #
+        # The vectors are a plain FLOAT[] rather than a fixed-width array: the
+        # width belongs to the embedding model, which is a setting, and
+        # `list_cosine_similarity` is core DuckDB, so no extension has to be
+        # downloaded before a search can run. No primary key on the chunks
+        # either; they are replaced a source at a time, never looked up.
+        "0006_text_chunks",
+        """
+        CREATE TABLE IF NOT EXISTS text_sources (
+            file_id       TEXT NOT NULL,
+            source        TEXT NOT NULL,
+            fingerprint   TEXT NOT NULL,
+            model         TEXT NOT NULL,
+            chunks        INTEGER NOT NULL,
+            indexed_at_ms BIGINT NOT NULL,
+            PRIMARY KEY (file_id, source)
+        );
+
+        CREATE TABLE IF NOT EXISTS text_chunks (
+            file_id   TEXT NOT NULL,
+            source    TEXT NOT NULL,
+            position  INTEGER NOT NULL,
+            page      INTEGER,
+            text      TEXT NOT NULL,
+            embedding FLOAT[] NOT NULL
+        );
+        """,
+    ),
 ]
 
 
@@ -652,6 +685,116 @@ class PaperDb:
     def count_model_answers(self) -> int:
         return self._conn.execute("SELECT count(*) FROM model_answers").fetchone()[0]
 
+    # ---- semantic search ---------------------------------------------------
+
+    def text_fingerprints(self) -> list[tuple[str, str, str]]:
+        """`(file_id, source, fingerprint)` for every source already embedded."""
+        return [
+            tuple(row)
+            for row in self._conn.execute(
+                "SELECT file_id, source, fingerprint FROM text_sources"
+            ).fetchall()
+        ]
+
+    def replace_text_chunks(
+        self,
+        file_id: str,
+        source: str,
+        fingerprint: str,
+        model: str,
+        chunks: Sequence[tuple[int, int | None, str, Sequence[float]]],
+    ) -> None:
+        """Swap one source's chunks for these, each `(position, page, text, embedding)`.
+
+        An empty `chunks` is still recorded: a scan nobody has read, a PDF that
+        will not parse, have no text to embed, and remembering that is what
+        stops every later pass from opening them again to find the same nothing.
+        Their fingerprints say so; see `semantic.UNREADABLE`.
+        """
+        with self._transaction():
+            self._conn.execute(
+                "DELETE FROM text_chunks WHERE file_id = ? AND source = ?",
+                [file_id, source],
+            )
+            if chunks:
+                # Each vector crosses as JSON text and is cast in SQL. Bound as
+                # a Python list, every float is converted one at a time, which
+                # costs ~50ms a chunk -- twelve minutes to backfill a library
+                # that this does in a few seconds.
+                self._conn.executemany(
+                    "INSERT INTO text_chunks VALUES (?, ?, ?, ?, ?, ?::FLOAT[])",
+                    [
+                        [file_id, source, position, page, text, json.dumps(list(embedding))]
+                        for position, page, text, embedding in chunks
+                    ],
+                )
+            self._conn.execute(
+                """
+                INSERT INTO text_sources VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (file_id, source) DO UPDATE SET
+                    fingerprint = excluded.fingerprint,
+                    model = excluded.model,
+                    chunks = excluded.chunks,
+                    indexed_at_ms = excluded.indexed_at_ms
+                """,
+                [file_id, source, fingerprint, model, len(chunks), now_ms()],
+            )
+
+    def drop_text_source(self, file_id: str, source: str) -> None:
+        """Forget one source's chunks -- a note that was deleted, say."""
+        with self._transaction():
+            for table in ("text_chunks", "text_sources"):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE file_id = ? AND source = ?",  # noqa: S608
+                    [file_id, source],
+                )
+
+    def nearest_chunks(
+        self, embedding: Sequence[float], model: str, limit: int = 10
+    ) -> list[tuple[str, str | None, str, int | None, str, float]]:
+        """The best-matching chunk of each of the `limit` closest documents.
+
+        Rows are `(file_id, title, source, page, text, score)`, score being cosine
+        similarity, highest first. One row per document rather than per chunk:
+        a long paper is many chunks saying nearly the same thing, and ten hits
+        from one book would read as ten answers.
+
+        Every chunk is compared rather than an index being searched. A personal
+        library is tens of thousands of chunks, which DuckDB scans in
+        milliseconds; an HNSW index would add an extension and a persistence
+        mode DuckDB still calls experimental, for no speed anyone would notice.
+        Chunks embedded by a different model are left out -- their vectors
+        live in another space and their scores would mean nothing.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT c.file_id, coalesce(p.title, p.original_name), c.source, c.page,
+                   c.text, list_cosine_similarity(c.embedding, ?::FLOAT[]) AS score
+            FROM text_chunks c
+            JOIN text_sources s ON s.file_id = c.file_id AND s.source = c.source
+            LEFT JOIN papers p ON p.file_id = c.file_id
+            WHERE s.model = ?
+            QUALIFY row_number() OVER (PARTITION BY c.file_id ORDER BY score DESC) = 1
+            ORDER BY score DESC
+            LIMIT ?
+            """,
+            [json.dumps(list(embedding)), model, int(limit)],
+        ).fetchall()
+        return [tuple(row) for row in rows]
+
+    def unindexed_count(self, model: str) -> int:
+        """How many documents have no text embedded by `model` yet."""
+        return self._conn.execute(
+            """
+            SELECT count(*) FROM papers p
+            WHERE NOT EXISTS (
+                SELECT 1 FROM text_sources s
+                WHERE s.file_id = p.file_id AND s.source = '' AND s.model = ?
+            )
+            """,
+            [model],
+        ).fetchone()[0]
+
     def delete(self, file_id: str) -> None:
         """Forget a document entirely."""
         with self._transaction():
@@ -660,6 +803,8 @@ class PaperDb:
                 "paper_authors",
                 "paper_keywords",
                 "paper_attributes",
+                "text_chunks",
+                "text_sources",
                 "papers",
             ):
                 self._conn.execute(

@@ -213,6 +213,59 @@ def test_the_watcher_spends_the_stored_key(keychain: dict, spender: None) -> Non
     assert resolve_api_key() == "sk-the-watchers-key"
 
 
+# ---- the watcher's fallback when there is no keychain ----------------------
+
+
+def _write_env_file(text: str):
+    path = config.watcher_env_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_watcher_falls_back_to_its_env_file(no_keychain: None, spender: None) -> None:
+    # KeePassXC not running, a headless box: `login` has nowhere to put the key,
+    # and a service inherits no shell, so this file is how it is handed one.
+    _write_env_file("OPENAI_API_KEY=sk-from-the-file\n")
+    assert resolve_api_key() == "sk-from-the-file"
+
+
+def test_the_keychain_still_wins_over_the_env_file(keychain: dict, spender: None) -> None:
+    _write_env_file("OPENAI_API_KEY=sk-from-the-file\n")
+    config.store_api_key("sk-the-watchers-key")
+    assert resolve_api_key() == "sk-the-watchers-key"
+
+
+def test_a_command_run_by_hand_does_not_spend_the_env_file(no_keychain: None) -> None:
+    # The file is the watcher's credential, the same as the keychain entry it
+    # stands in for, so the spender rule covers it too.
+    _write_env_file("OPENAI_API_KEY=sk-from-the-file\n")
+    with pytest.raises(ConfigError, match="which is what spends it"):
+        resolve_api_key()
+
+
+def test_the_env_file_leaks_nothing_into_the_environment(
+    no_keychain: None, spender: None
+) -> None:
+    import os
+
+    _write_env_file("OPENAI_API_KEY=sk-from-the-file\nSYP_LLM_MODEL=other\n")
+    resolve_api_key()
+    assert "SYP_LLM_MODEL" not in os.environ
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_no_keychain_to_store_in_names_the_env_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Exploding:
+        @staticmethod
+        def set_password(service, user, value):
+            raise RuntimeError("no backend")
+
+    monkeypatch.setitem(__import__("sys").modules, "keyring", Exploding)
+    with pytest.raises(ConfigError, match=str(config.watcher_env_path())):
+        config.store_api_key("sk-x")
+
+
 def test_a_client_never_reads_the_keychain_at_all(monkeypatch) -> None:
     """Not even to write a better error message.
 
@@ -328,3 +381,140 @@ def test_the_default_collection_still_wins(monkeypatch) -> None:
 
     assert config.key_from_keychain() == "sk-from-default"
     assert other.read is False  # no need to look further
+
+
+def test_a_backend_chosen_before_the_keyring_existed_is_reconsidered(monkeypatch) -> None:
+    """`keyring` picks a backend once and keeps it for the life of the process.
+
+    The watcher starts at login and routinely beats the desktop keyring onto
+    the bus — KeePassXC registers org.freedesktop.secrets only while running,
+    and nothing can activate it — so the choice made in that second is "no
+    backend", and `sypy login` through a day-old watcher fails against a
+    keyring that has been sitting there unlocked for hours.
+    """
+    import sys
+    import types
+
+    class Failing:
+        """Stands in for keyring.backends.fail.Keyring."""
+
+    stored: dict = {}
+    working = types.SimpleNamespace(
+        get_password=lambda s, u: stored.get((s, u)),
+        set_password=lambda s, u, v: stored.__setitem__((s, u), v),
+    )
+    backend = [Failing()]
+
+    module = types.SimpleNamespace(
+        get_keyring=lambda: backend[0],
+        core=types.SimpleNamespace(
+            init_backend=lambda: backend.__setitem__(0, working)
+        ),
+        get_password=lambda s, u: backend[0].get_password(s, u),
+        set_password=lambda s, u, v: backend[0].set_password(s, u, v),
+    )
+    monkeypatch.setitem(sys.modules, "keyring", module)
+    fail = types.SimpleNamespace(Keyring=Failing)
+    monkeypatch.setitem(sys.modules, "keyring.backends", types.SimpleNamespace(fail=fail))
+    monkeypatch.setitem(sys.modules, "keyring.backends.fail", fail)
+
+    config.store_api_key("sk-after-the-keyring-woke-up")
+    assert stored[(config.KEYRING_SERVICE, config.KEYRING_USERNAME)] == (
+        "sk-after-the-keyring-woke-up"
+    )
+
+
+def test_the_keychain_is_read_once_per_key_not_once_per_question(monkeypatch) -> None:
+    """A desktop keyring confirms per access, not per process.
+
+    KeePassXC has no "allow this program from now on", so every read is another
+    dialog -- and the watcher is asked for the key by every `ping`, which is
+    what `sypy doctor` and `sypy status` each do. A `login` must still land
+    without a restart, which is what the generation counter is for.
+    """
+    import sys
+    import types
+
+    reads = []
+    stored = {"key": "sk-first"}
+    module = types.SimpleNamespace(
+        get_password=lambda s, u: (reads.append((s, u)), stored["key"])[1],
+        set_password=lambda s, u, v: stored.__setitem__("key", v),
+    )
+    monkeypatch.setitem(sys.modules, "keyring", module)
+    monkeypatch.setattr(config, "_MAY_USE_KEYCHAIN", True)
+
+    assert [config.resolve_api_key() for _ in range(5)] == ["sk-first"] * 5
+    assert len(reads) == 1, "one dialog, not five"
+
+    config.store_api_key("sk-second")
+    assert config.resolve_api_key() == "sk-second"
+    assert len(reads) == 2, "a login lands without restarting the watcher"
+
+
+def test_having_no_key_is_remembered_too(monkeypatch) -> None:
+    """A watcher started before `login` is asked for a key by every `ping`.
+
+    Prompting each time is the same dialog storm for a keychain that has
+    nothing to give.
+    """
+    import sys
+    import types
+
+    reads = []
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        types.SimpleNamespace(get_password=lambda s, u: (reads.append(1), None)[1]),
+    )
+    monkeypatch.setitem(sys.modules, "secretstorage", None)
+    monkeypatch.setattr(config, "_MAY_USE_KEYCHAIN", True)
+
+    for _ in range(5):
+        assert config.key_from_keychain() is None
+    assert len(reads) == 1
+
+
+def test_a_keychain_that_comes_up_later_is_found_once_the_miss_expires(monkeypatch) -> None:
+    """The watcher starts at login, often before KeePassXC is up or unlocked.
+
+    A miss remembered until the next `login` left it keyless all session with
+    the key sitting in an unlocked keychain.
+    """
+    import sys
+    import types
+
+    stored: list[str | None] = [None]
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        types.SimpleNamespace(get_password=lambda s, u: stored[0]),
+    )
+    monkeypatch.setitem(sys.modules, "secretstorage", None)
+    monkeypatch.setattr(config, "_MAY_USE_KEYCHAIN", True)
+    clock = [1000.0]
+    monkeypatch.setattr(config, "monotonic", lambda: clock[0])
+
+    assert config.key_from_keychain() is None
+    stored[0] = "sk-unlocked-later"
+    assert config.key_from_keychain() is None          # still inside the minute
+    clock[0] += config.KEY_MISS_SECONDS + 1
+    assert config.key_from_keychain() == "sk-unlocked-later"
+
+
+# ---- the size limit ---------------------------------------------------------
+
+
+def test_the_size_limit_comes_from_the_argument_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYP_MAX_FILE_SIZE_MB", "50")
+    assert config.resolve_settings(max_file_size_mb=200).max_file_size_bytes == 200 * 1024 * 1024
+    assert config.resolve_settings().max_file_size_mb == 50
+
+
+def test_a_size_limit_of_zero_is_no_limit() -> None:
+    assert config.resolve_settings(max_file_size_mb=0).max_file_size_bytes is None
+
+
+def test_a_negative_size_limit_is_refused() -> None:
+    with pytest.raises(ConfigError, match="max_file_size_mb"):
+        config.resolve_settings(max_file_size_mb=-1)

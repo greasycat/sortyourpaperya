@@ -224,6 +224,10 @@ def _no_real_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
     from sortyourpaperya import config as _config
 
     monkeypatch.setattr(_config, "_MAY_USE_KEYCHAIN", False)
+    # Likewise the remembered answer: the keychain is read once per key, so a
+    # test that installs its own fake would otherwise be answered by whatever
+    # the previous test's fake said.
+    monkeypatch.setattr(_config, "_CACHED_KEY", (-1, None))
     # With no keychain and no .env, commands that resolve a key would exit 2
     # before reaching what they are being tested for. They all inject a fake
     # model client, so the key only has to exist -- it is never spent, and a

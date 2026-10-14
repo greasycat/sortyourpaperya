@@ -24,7 +24,7 @@ def _no_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_building_it_resolves_nothing() -> None:
     # The whole point: this is what the watcher constructs at startup.
-    LazyOpenAiClient("gpt-5.6-terra")
+    LazyOpenAiClient("gpt-6-luna")
 
 
 @pytest.mark.asyncio

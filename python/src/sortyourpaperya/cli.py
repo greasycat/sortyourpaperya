@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from .config import (
     MAX_STEERING_CATEGORIES,
     DEFAULT_LABEL_CACHE_DAYS,
     DEFAULT_LLM_MAX_RETRIES,
+    DEFAULT_MAX_FILE_SIZE_MB,
     DEFAULT_LLM_TIMEOUT_SECONDS,
     ConfigError,
     env_float,
@@ -44,7 +46,7 @@ import subprocess
 
 from .library import FilingMode, Library, LibraryError
 from .llm import LazyOpenAiClient, LlmError, OpenAiClient
-from . import recategorize
+from . import protocol, recategorize, semantic
 from .naming import split_category
 from .registry import RegistryError, WatchEntry, load_registry, registry_path
 from .watch import watch as watch_loop
@@ -133,6 +135,13 @@ def ingest(
         "--mode",
         help="preview (default), copy to leave the source in place, or move.",
     ),
+    max_file_size_mb: int = typer.Option(
+        None,
+        "--max-file-size-mb",
+        min=0,
+        help="Skip PDFs larger than this; 0 for no limit. "
+        f"Default SYP_MAX_FILE_SIZE_MB, else {DEFAULT_MAX_FILE_SIZE_MB}.",
+    ),
 ) -> None:
     """Read every not-yet-known document and file it into the library.
 
@@ -149,12 +158,15 @@ def ingest(
 
     root = _resolved_library(library_dir)
     if root is not None and _client.serving(root):
-        report = _ingest_via_watcher(_client, root, input_dir, mode, model)
+        report = _ingest_via_watcher(
+            _client, root, input_dir, mode, model, max_file_size_mb
+        )
         _report_ingest(report, mode)
         return
 
     settings, client = _build(
-        input_dir, library_dir, recursive, page_cutoff, batch_size, model
+        input_dir, library_dir, recursive, page_cutoff, batch_size, model,
+        max_file_size_mb=max_file_size_mb,
     )
     with Library(settings.output_dir) as library:
         report = asyncio.run(ingest_folder(settings, client, library, mode=mode))
@@ -164,7 +176,9 @@ def ingest(
         raise typer.Exit(code=1)
 
 
-def _ingest_via_watcher(client_mod, root: Path, input_dir: Path | None, mode, model):
+def _ingest_via_watcher(
+    client_mod, root: Path, input_dir: Path | None, mode, model, max_file_size_mb=None
+):
     """Have the watcher file the folder, printing what it files as it goes.
 
     The pass runs there, so its per-document lines arrive as events rather than
@@ -194,6 +208,7 @@ def _ingest_via_watcher(client_mod, root: Path, input_dir: Path | None, mode, mo
             "input_dir": str(input_dir),
             "mode": mode.value,
             "model": model,
+            "max_file_size_mb": max_file_size_mb,
         },
         on_event=lambda frame: typer.echo(
             f"  {frame.get('event')}: {frame.get('input', '')}".rstrip(": ")
@@ -297,7 +312,15 @@ def watch(
     )
     try:
         with Library(settings.output_dir) as library:
-            asyncio.run(watch_loop(settings, client, library, mode=mode))
+            asyncio.run(
+                watch_loop(
+                    settings,
+                    client,
+                    library,
+                    mode=mode,
+                    embedder=semantic.LazyOpenAiEmbedder(),
+                )
+            )
     except WatchConflict as err:
         typer.echo(f"error: {err}", err=True)
         typer.echo(
@@ -1643,6 +1666,18 @@ def _doctor_model(ok, bad, warn, *, offline: bool) -> None:
             else:
                 ok(f"spend today {amount}/{ceiling} {noun}")
 
+    # Embedding's own ledger: spent, it fails `index` and `search` while the
+    # chat ceiling above still reads healthy.
+    embedding = semantic.embedding_budget()
+    amount, ceiling = embedding.usage().tokens, embedding.limits.tokens_per_day
+    if ceiling > 0 and amount >= ceiling:
+        bad(
+            f"the day's embedding tokens ceiling is spent ({amount}/{ceiling})",
+            "wait for the window to roll over, or `sypy budget --reset`",
+        )
+    elif ceiling > 0:
+        ok(f"embedding today {amount}/{ceiling} tokens")
+
 
 def _probe_api(key: str) -> str | None:
     """None when the key works, else one line saying why not.
@@ -1736,8 +1771,10 @@ def budget(
 ) -> None:
     """Show what the last 24 hours have cost at the API, against the ceiling."""
     ledger = Budget()
+    embedding = semantic.embedding_budget()
     if reset:
         ledger.reset()
+        embedding.reset()
         typer.echo("spend record cleared")
         return
 
@@ -1746,6 +1783,14 @@ def budget(
     typer.echo(f"last 24 hours, from {ledger.path}")
     typer.echo(f"  requests  {used.requests:>8} / {_ceiling(limits.requests_per_day)}")
     typer.echo(f"  tokens    {used.tokens:>8} / {_ceiling(limits.tokens_per_day)}")
+    # Embedding keeps its own ledger -- see `semantic.embedding_budget` -- and a
+    # spent one stops `index` and `search` with nothing here to say why.
+    embedded = embedding.usage()
+    typer.echo(f"embeddings, from {embedding.path}")
+    typer.echo(f"  requests  {embedded.requests:>8}")
+    typer.echo(
+        f"  tokens    {embedded.tokens:>8} / {_ceiling(embedding.limits.tokens_per_day)}"
+    )
     if limits.unlimited:
         typer.echo(
             "\nboth ceilings are off. The watcher restarts on failure, so "
@@ -1889,6 +1934,185 @@ def find(
                 "or pass --limit 0 for all of them",
                 err=True,
             )
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="What you are looking for, in your own words."),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+    limit: int = typer.Option(10, "--limit", "-n", min=1, help="Most documents to show."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print records instead of a table, for a program to read."
+    ),
+) -> None:
+    """Find documents by what they and their notes say, matched by meaning.
+
+    Where `find` matches words against titles, authors, and tags, this compares
+    the query with the text inside each document and each of its notes, so it
+    finds a paper that never uses the query's words. Each document shows the
+    passage that came closest, and the page it is on.
+
+    Only what `sypy index` -- or the watcher, after each filing -- has embedded
+    is searched. Embedding the query is one small request on the watcher's key,
+    or on OPENAI_API_KEY when no watcher is running.
+    """
+    from . import client as _client
+
+    root = _resolved_library(library_dir)
+    unindexed = None
+    try:
+        if root is not None and _client.serving(root):
+            hits = protocol.load(
+                _client.call(root, "search", {"query": query, "limit": limit})
+            )
+        else:
+            settings = _settings(None, library_dir)
+            embedder = _local_embedder()
+            with _reading(settings.output_dir) as library:
+                hits = asyncio.run(semantic.search(library, embedder, query, limit))
+                try:
+                    unindexed = library.db.unindexed_count(embedder.model)
+                except Exception:
+                    # A library no writer has migrated has no index to count.
+                    unindexed = None
+    except (ConfigError, RuntimeError) as err:
+        # A spent budget, a refused key, a request that would not go: each is
+        # its own line rather than a traceback.
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    if as_json:
+        typer.echo(json.dumps([dataclasses.asdict(hit) for hit in hits], indent=2))
+        return
+    for hit in hits:
+        typer.echo(f"{hit.score:.3f}  {hit.file_id}  {hit.title or ''}")
+        where = hit.source or (f"p. {hit.page}" if hit.page else "text")
+        snippet = " ".join(hit.text.split())
+        if len(snippet) > 200:
+            snippet = snippet[:200] + "…"
+        typer.echo(f"       {where}: {snippet}")
+    if not hits:
+        typer.echo("nothing indexed matched; `sypy index` embeds the library", err=True)
+    if unindexed:
+        typer.echo(
+            f"{unindexed} document(s) are not indexed yet; `sypy index` adds them",
+            err=True,
+        )
+
+
+@app.command()
+def index(
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """Embed documents and notes for `sypy search`, where they have changed.
+
+    Only what is new or changed costs anything: a document is embedded once per
+    content, a note once per edit. The watcher runs this after every filing, so
+    by hand it is for the first time, and for notes edited since.
+    """
+    from . import client as _client
+
+    root = _resolved_library(library_dir)
+    try:
+        with _index_bar() as show:
+
+            async def progress(done: int, total: int, what: str) -> None:
+                show(done, total, what)
+
+            if root is not None and _client.serving(root):
+                report = protocol.load(
+                    _client.call(
+                        root,
+                        "index",
+                        {},
+                        on_event=lambda frame: (
+                            typer.echo(f"waiting for {frame.get('what', '')}", err=True)
+                            if frame.get("event") == "waiting"
+                            else show(
+                                frame.get("done", 0), frame.get("total", 0), frame.get("what", "")
+                            )
+                        ),
+                    )
+                )
+            else:
+                settings = _settings(None, library_dir)
+                embedder = _local_embedder()
+                with Library(settings.output_dir) as library:
+                    report = asyncio.run(
+                        semantic.index_library(library, embedder, progress=progress)
+                    )
+    except (ConfigError, RuntimeError) as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    typer.echo(
+        f"indexed {len(report.indexed)} source(s) ({report.chunks} chunk(s)); "
+        f"{report.unchanged} unchanged, {report.removed} removed, "
+        f"{len(report.failed)} failed"
+    )
+    for label, reason in report.failed:
+        typer.echo(f"  could not index {label}: {reason}", err=True)
+    if report.stopped:
+        typer.echo(
+            f"stopped early, {report.left} source(s) not tried: {report.stopped}", err=True
+        )
+    if report.failed or report.stopped:
+        raise typer.Exit(code=1)
+
+
+@contextlib.contextmanager
+def _index_bar():
+    """A progress bar on stderr, and the function that moves it.
+
+    Stderr, so stdout keeps only the summary a script would read. Off a
+    terminal rich draws nothing live, so a log gets the summary and no bar.
+    The bar is not created until there is a total to show: an unchanged library
+    has nothing to embed, and a bar that sits at 0/0 says something is wrong.
+    """
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
+    bar = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]indexing"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn("eta"),
+        TimeRemainingColumn(),
+        TextColumn("{task.description}", style="dim"),
+        console=Console(stderr=True),
+        transient=True,
+    )
+    task = None
+
+    def show(done: int, total: int, what: str) -> None:
+        nonlocal task
+        if not total:
+            return
+        if task is None:
+            task = bar.add_task(what, total=total)
+        bar.update(task, completed=done, total=total, description=what)
+
+    with bar:
+        yield show
+
+
+def _local_embedder() -> "semantic.OpenAiEmbedder":
+    """An embedder for a command run with no watcher, on this shell's key."""
+    try:
+        return semantic.OpenAiEmbedder(resolve_api_key())
+    except ConfigError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=2) from err
 
 
 @app.command()
@@ -2206,6 +2430,7 @@ def _build_settings(
     page_cutoff: int | None,
     batch_size: int | None,
     model: str | None,
+    max_file_size_mb: int | None = None,
 ):
     """Settings alone, for a caller that does not want a key resolved yet."""
     try:
@@ -2216,6 +2441,7 @@ def _build_settings(
             page_cutoff=page_cutoff,
             keyword_batch_size=batch_size,
             model=model,
+            max_file_size_mb=max_file_size_mb,
         )
     except ConfigError as err:
         typer.echo(f"error: {err}", err=True)
@@ -2229,8 +2455,11 @@ def _build(
     page_cutoff: int | None,
     batch_size: int | None,
     model: str | None,
+    max_file_size_mb: int | None = None,
 ):
-    settings = _build_settings(input_dir, library_dir, recursive, page_cutoff, batch_size, model)
+    settings = _build_settings(
+        input_dir, library_dir, recursive, page_cutoff, batch_size, model, max_file_size_mb
+    )
     try:
         return settings, OpenAiClient(
             resolve_api_key(),

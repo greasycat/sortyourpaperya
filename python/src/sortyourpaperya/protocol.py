@@ -93,6 +93,7 @@ def _registry() -> dict[str, type]:
     from .db import ModelAnswer, Paper
     from .ingest import IngestReport
     from .library import BackupReport, PlannedFiling, RescanReport
+    from .semantic import IndexReport, SearchHit
 
     return {
         c.__name__: c
@@ -103,6 +104,8 @@ def _registry() -> dict[str, type]:
             BackupReport,
             PlannedFiling,
             IngestReport,
+            IndexReport,
+            SearchHit,
         )
     }
 

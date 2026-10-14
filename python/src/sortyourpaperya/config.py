@@ -8,17 +8,18 @@ variable names, so a folder set up for either reads the same to the other.
 from __future__ import annotations
 
 import os
+from time import monotonic
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 # Mirrors the Rust defaults so the two pipelines read the same folder the same way.
 DEFAULT_OUTPUT_DIR = "sorted"
 DEFAULT_MAX_FILE_SIZE_MB = 16
 DEFAULT_PAGE_CUTOFF = 1
 DEFAULT_KEYWORD_BATCH_SIZE = 20
-DEFAULT_MODEL = "gpt-5.6-terra"
+DEFAULT_MODEL = "gpt-6-luna"
 
 # Text budget per request, matching `MAX_TOTAL_BATCH_TEXT_CHARS` and
 # `MAX_TEXT_CHARS_PER_FILE` in crates/syp-library/src/papers/taxonomy/mod.rs.
@@ -37,7 +38,15 @@ MAX_STEERING_CATEGORIES = 200
 # What the tool is allowed to spend at the API in a rolling day, and how
 # hard it tries before giving a request up. The watcher runs unattended under
 # `KeepAlive`, so nothing else in the process would ever stop it paying.
-DEFAULT_MAX_REQUESTS_PER_DAY = 500
+#
+# There is no ceiling on requests: a day's filing is however many documents
+# turned up that day, and a number picked here is wrong for anyone whose
+# backlog is larger than the person who picked it. What the ceiling exists to
+# catch is a restart loop re-reading the same folder forever, and tokens catch
+# that just as well while costing nothing to a person merely filing a lot --
+# they are also what the bill is actually denominated in. Set
+# `SYP_MAX_REQUESTS_PER_DAY` to put the request ceiling back.
+DEFAULT_MAX_REQUESTS_PER_DAY = 0
 DEFAULT_MAX_TOKENS_PER_DAY = 1_000_000
 DEFAULT_LLM_MAX_RETRIES = 2
 DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
@@ -97,9 +106,23 @@ class Settings:
     model: str = DEFAULT_MODEL
 
     def __post_init__(self) -> None:
-        for name in ("max_file_size_mb", "page_cutoff", "keyword_batch_size"):
+        for name in ("page_cutoff", "keyword_batch_size"):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"{name} must be greater than 0")
+        if self.max_file_size_mb < 0:
+            raise ConfigError("max_file_size_mb must be 0 (no limit) or greater")
+
+    @property
+    def max_file_size_bytes(self) -> int | None:
+        """The size past which a PDF is skipped, or None when there is no limit.
+
+        0 is "no limit", as it is for the spend ceilings: the limit exists to
+        keep a stray scan of a whole book from being read, and someone filing
+        one on purpose should not have to guess a number larger than it.
+        """
+        if self.max_file_size_mb == 0:
+            return None
+        return self.max_file_size_mb * 1024 * 1024
 
 
 def resolve_settings(
@@ -110,6 +133,7 @@ def resolve_settings(
     page_cutoff: int | None = None,
     keyword_batch_size: int | None = None,
     model: str | None = None,
+    max_file_size_mb: int | None = None,
 ) -> Settings:
     """Resolve settings from explicit arguments, then ``SYP_*`` variables, then defaults.
 
@@ -131,7 +155,9 @@ def resolve_settings(
         output_dir=resolved_output,
         recursive=_first_bool(recursive, os.getenv("SYP_RECURSIVE"), False),
         max_file_size_mb=_first_int(
-            None, os.getenv("SYP_MAX_FILE_SIZE_MB"), DEFAULT_MAX_FILE_SIZE_MB
+            max_file_size_mb,
+            os.getenv("SYP_MAX_FILE_SIZE_MB"),
+            DEFAULT_MAX_FILE_SIZE_MB,
         ),
         page_cutoff=_first_int(
             page_cutoff, os.getenv("SYP_PAGE_CUTOFF"), DEFAULT_PAGE_CUTOFF
@@ -159,9 +185,40 @@ def key_generation() -> int:
     return _KEY_GENERATION
 
 
+# What the keychain last said, and at which generation it said it. A desktop
+# keyring confirms per *access*, not per process: KeePassXC has no "allow this
+# program from now on", so every read is another dialog. The watcher reads on
+# every `ping` -- which is what `sypy doctor` and `sypy status` each do -- and a
+# person who cannot answer one of those is a person whose watcher stalls. One
+# read per key, then, and `_key_changed` below is what makes a `login` land.
+_CACHED_KEY: tuple[int, str | None] = (-1, None)
+
+# How long "no key" is believed. A found key stands until `login` or `logout`
+# changes it, but a miss cannot be trusted that long: the watcher starts at login
+# and may ask before KeePassXC is running or unlocked, and a miss remembered
+# until the next `login` left it keyless for the whole session -- while the
+# keychain sat there unlocked, with the key in it. A minute keeps the dialog
+# from being asked for on every `ping`, and the next request after it looks again.
+KEY_MISS_SECONDS = 60.0
+_MISS_UNTIL = 0.0
+
+
 def _key_changed() -> None:
-    global _KEY_GENERATION
+    global _KEY_GENERATION, _CACHED_KEY
     _KEY_GENERATION += 1
+    _CACHED_KEY = (-1, None)
+
+
+def forget_cached_key() -> None:
+    """Read the key afresh next time: the API has just refused this one.
+
+    A key found in the keychain is otherwise believed until `login` or
+    `logout` -- but it can be rotated in the keyring itself, or stored by a
+    `login` that never reached this process, and a watcher holding the old one
+    would fail every request until restarted. A refusal is the one sign that
+    the cached key is wrong, and it costs one keychain read to act on.
+    """
+    _key_changed()
 
 
 # Whether this process may spend the key `login` stored. False everywhere until
@@ -204,6 +261,9 @@ def resolve_api_key() -> str:
     The environment still works and is still what a container or a CI job uses,
     so nothing that worked before stops working.
 
+    Last, and in the watcher only, `watcher_env_path`: the key for a session
+    with no keychain to keep it in.
+
     ``OEPNAI_API_KEY`` is accepted because the repository's own ``.env`` spells
     it that way; the correct spelling wins when both are set.
     """
@@ -216,6 +276,10 @@ def resolve_api_key() -> str:
         value = (os.getenv(name) or "").strip()
         if value:
             return value
+    if _MAY_USE_KEYCHAIN:
+        fallback = key_from_env_file()
+        if fallback:
+            return fallback
     if not _MAY_USE_KEYCHAIN:
         # Deliberately without asking the keychain whether it holds one. Reading
         # it is what makes a locked keyring prompt, and a command that cannot
@@ -229,20 +293,98 @@ def resolve_api_key() -> str:
         )
     raise ConfigError(
         "no API key found; run `sypy login` so the watcher has one, "
-        "or set OPENAI_API_KEY in the environment or in .env"
+        f"or put OPENAI_API_KEY=... in {watcher_env_path()} for a machine "
+        "with no keychain"
     )
+
+
+def watcher_env_path() -> Path:
+    """The file the watcher falls back to when there is no keychain to read.
+
+    Beside the watch registry, because both belong to the person rather than to
+    the checkout. It exists for the session the keychain is absent from -- a
+    KeePassXC that is not running, a headless box -- where `login` has nowhere
+    to put the key and the service, inheriting no shell, has no other way to
+    be handed one.
+    """
+    from .registry import registry_path
+
+    return registry_path().parent / "env"
+
+
+def key_from_env_file() -> str | None:
+    """The key in `watcher_env_path`, or None when there is no such file or key.
+
+    Read with `dotenv_values` rather than loaded, so the file answers for the
+    key and nothing else in it leaks into the process environment.
+    """
+    path = watcher_env_path()
+    if not path.is_file():
+        return None
+    values = dotenv_values(path)
+    for name in ("OPENAI_API_KEY", "SYP_API_KEY"):
+        value = (values.get(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _keyring():
+    """The `keyring` module, with a backend chosen now rather than at import.
+
+    `keyring` picks its backend the first time it is used and keeps that choice
+    for the life of the process. The watcher is started at login and may well
+    beat the desktop keyring to the bus -- KeePassXC registers
+    org.freedesktop.secrets only while it is running, and nothing on the bus
+    can activate it -- so the choice made in that second is "no backend", and
+    it would otherwise stand for the whole session. A long-lived process asks
+    again, but only when the cached answer was a failure, so a machine that
+    genuinely has no keychain still pays one D-Bus probe per call and no more.
+    """
+    import keyring
+
+    try:
+        from keyring.backends import fail
+
+        if isinstance(keyring.get_keyring(), fail.Keyring):
+            keyring.core.init_backend()
+    except Exception:
+        # A stub in place of the real module, or a `keyring` whose internals
+        # have moved: whatever is there is what gets used, unexamined.
+        pass
+    return keyring
 
 
 def key_from_keychain() -> str | None:
     """The stored key, or None when there is none or no keychain to ask.
+
+    Answered from the last read until the key changes; see `_CACHED_KEY`. The
+    absence of a key is cached too, but only for `KEY_MISS_SECONDS` -- a watcher
+    started before `login` is asked for one by every `ping`, and prompting each
+    time is the same dialog storm for a keychain that has nothing to give, while
+    remembering it for good misses a keychain that comes up after the watcher.
 
     A machine with no keychain — a container, a headless box with no Secret
     Service running — is not an error here: it is the ordinary case for the
     environment variable below, so a missing backend falls through rather than
     refusing to start.
     """
+    global _CACHED_KEY, _MISS_UNTIL
+    generation, cached = _CACHED_KEY
+    if generation == _KEY_GENERATION and (
+        cached is not None or monotonic() < _MISS_UNTIL
+    ):
+        return cached
+    value = _read_keychain()
+    _CACHED_KEY = (_KEY_GENERATION, value)
+    _MISS_UNTIL = monotonic() + KEY_MISS_SECONDS if value is None else 0.0
+    return value
+
+
+def _read_keychain() -> str | None:
+    """Ask the keychain itself. Prompts, on a keyring that confirms per access."""
     try:
-        import keyring
+        keyring = _keyring()
 
         value = (keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or "").strip()
         if value:
@@ -296,11 +438,14 @@ def _from_any_collection() -> str | None:
 def store_api_key(key: str) -> None:
     """Put the key in the platform keychain. Raises ConfigError if there is none."""
     try:
-        import keyring
+        keyring = _keyring()
 
         keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, key)
     except Exception as exc:
-        raise ConfigError(f"no keychain available to store the key: {exc}") from exc
+        raise ConfigError(
+            f"no keychain available to store the key: {exc}. Without one, the "
+            f"watcher reads OPENAI_API_KEY from {watcher_env_path()} instead"
+        ) from exc
     _key_changed()
 
 
@@ -315,7 +460,7 @@ def forget_api_key() -> bool:
     on every later run is the same. Only if that also fails is it an error.
     """
     try:
-        import keyring
+        keyring = _keyring()
     except Exception as exc:
         raise ConfigError(f"no keychain available: {exc}") from exc
 
