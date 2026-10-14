@@ -228,6 +228,7 @@ def _no_real_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
     # test that installs its own fake would otherwise be answered by whatever
     # the previous test's fake said.
     monkeypatch.setattr(_config, "_CACHED_KEY", (-1, None))
+    monkeypatch.setattr(_config, "_REREAD_AFTER", 0.0)
     # With no keychain and no .env, commands that resolve a key would exit 2
     # before reaching what they are being tested for. They all inject a fake
     # model client, so the key only has to exist -- it is never spent, and a

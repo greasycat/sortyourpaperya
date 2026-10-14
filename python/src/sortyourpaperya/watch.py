@@ -8,7 +8,6 @@ coalesced, missed, or caused by the pipeline's own writes.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -235,13 +234,23 @@ class _Indexer:
     async def drain(self) -> None:
         """Wait for the pass in flight, for a watcher stopping on its own."""
         if self._task is not None:
-            await self._task
+            await self._settle(self._task)
 
     async def stop(self) -> None:
+        """Cancel the pass in flight. Never raises: it runs in the watcher's
+        `finally`, ahead of releasing the socket and the claim."""
         if self._task is not None and not self._task.done():
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
+            await self._settle(self._task)
+
+    @staticmethod
+    async def _settle(task: "asyncio.Task[None]") -> None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as err:  # an index pass must not take the watcher with it
+            log.error("indexing for search failed: %s", err)
 
 
 async def _index(server: Server, library: Library, embedder: "Embedder") -> None:
