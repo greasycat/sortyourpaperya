@@ -383,6 +383,125 @@ def test_the_default_collection_still_wins(monkeypatch) -> None:
     assert other.read is False  # no need to look further
 
 
+def test_a_backend_chosen_before_the_keyring_existed_is_reconsidered(monkeypatch) -> None:
+    """`keyring` picks a backend once and keeps it for the life of the process.
+
+    The watcher starts at login and routinely beats the desktop keyring onto
+    the bus — KeePassXC registers org.freedesktop.secrets only while running,
+    and nothing can activate it — so the choice made in that second is "no
+    backend", and `sypy login` through a day-old watcher fails against a
+    keyring that has been sitting there unlocked for hours.
+    """
+    import sys
+    import types
+
+    class Failing:
+        """Stands in for keyring.backends.fail.Keyring."""
+
+    stored: dict = {}
+    working = types.SimpleNamespace(
+        get_password=lambda s, u: stored.get((s, u)),
+        set_password=lambda s, u, v: stored.__setitem__((s, u), v),
+    )
+    backend = [Failing()]
+
+    module = types.SimpleNamespace(
+        get_keyring=lambda: backend[0],
+        core=types.SimpleNamespace(
+            init_backend=lambda: backend.__setitem__(0, working)
+        ),
+        get_password=lambda s, u: backend[0].get_password(s, u),
+        set_password=lambda s, u, v: backend[0].set_password(s, u, v),
+    )
+    monkeypatch.setitem(sys.modules, "keyring", module)
+    fail = types.SimpleNamespace(Keyring=Failing)
+    monkeypatch.setitem(sys.modules, "keyring.backends", types.SimpleNamespace(fail=fail))
+    monkeypatch.setitem(sys.modules, "keyring.backends.fail", fail)
+
+    config.store_api_key("sk-after-the-keyring-woke-up")
+    assert stored[(config.KEYRING_SERVICE, config.KEYRING_USERNAME)] == (
+        "sk-after-the-keyring-woke-up"
+    )
+
+
+def test_the_keychain_is_read_once_per_key_not_once_per_question(monkeypatch) -> None:
+    """A desktop keyring confirms per access, not per process.
+
+    KeePassXC has no "allow this program from now on", so every read is another
+    dialog -- and the watcher is asked for the key by every `ping`, which is
+    what `sypy doctor` and `sypy status` each do. A `login` must still land
+    without a restart, which is what the generation counter is for.
+    """
+    import sys
+    import types
+
+    reads = []
+    stored = {"key": "sk-first"}
+    module = types.SimpleNamespace(
+        get_password=lambda s, u: (reads.append((s, u)), stored["key"])[1],
+        set_password=lambda s, u, v: stored.__setitem__("key", v),
+    )
+    monkeypatch.setitem(sys.modules, "keyring", module)
+    monkeypatch.setattr(config, "_MAY_USE_KEYCHAIN", True)
+
+    assert [config.resolve_api_key() for _ in range(5)] == ["sk-first"] * 5
+    assert len(reads) == 1, "one dialog, not five"
+
+    config.store_api_key("sk-second")
+    assert config.resolve_api_key() == "sk-second"
+    assert len(reads) == 2, "a login lands without restarting the watcher"
+
+
+def test_having_no_key_is_remembered_too(monkeypatch) -> None:
+    """A watcher started before `login` is asked for a key by every `ping`.
+
+    Prompting each time is the same dialog storm for a keychain that has
+    nothing to give.
+    """
+    import sys
+    import types
+
+    reads = []
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        types.SimpleNamespace(get_password=lambda s, u: (reads.append(1), None)[1]),
+    )
+    monkeypatch.setitem(sys.modules, "secretstorage", None)
+    monkeypatch.setattr(config, "_MAY_USE_KEYCHAIN", True)
+
+    for _ in range(5):
+        assert config.key_from_keychain() is None
+    assert len(reads) == 1
+
+
+def test_a_keychain_that_comes_up_later_is_found_once_the_miss_expires(monkeypatch) -> None:
+    """The watcher starts at login, often before KeePassXC is up or unlocked.
+
+    A miss remembered until the next `login` left it keyless all session with
+    the key sitting in an unlocked keychain.
+    """
+    import sys
+    import types
+
+    stored: list[str | None] = [None]
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        types.SimpleNamespace(get_password=lambda s, u: stored[0]),
+    )
+    monkeypatch.setitem(sys.modules, "secretstorage", None)
+    monkeypatch.setattr(config, "_MAY_USE_KEYCHAIN", True)
+    clock = [1000.0]
+    monkeypatch.setattr(config, "monotonic", lambda: clock[0])
+
+    assert config.key_from_keychain() is None
+    stored[0] = "sk-unlocked-later"
+    assert config.key_from_keychain() is None          # still inside the minute
+    clock[0] += config.KEY_MISS_SECONDS + 1
+    assert config.key_from_keychain() == "sk-unlocked-later"
+
+
 # ---- the size limit ---------------------------------------------------------
 
 
