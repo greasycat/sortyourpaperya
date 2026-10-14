@@ -504,16 +504,17 @@ async def test_the_watcher_keeps_filing_while_it_indexes(
     assert len(library.db.text_fingerprints()) == 2
 
 
-async def test_a_failed_request_stops_the_pass_instead_of_splitting(
+async def test_a_failed_request_stops_the_pass_after_one_probe(
     settings: Settings, library: Library
 ) -> None:
     """A network failure says nothing about the input; one request per source
-    would each wait out their retries to fail the same way."""
+    would each wait out their retries to fail the same way. The batch, then one
+    source alone, then stop."""
     await _file(settings, library, a="reward shaping", b="dopamine error")
     embedder = FakeEmbedder()
     embedder.fail = True
     report = await index_library(library, embedder)
-    assert len(embedder.calls) == 1
+    assert len(embedder.calls) == 2
     assert report.stopped and len(report.failed) == 2
     assert library.db.text_fingerprints() == []
 
@@ -541,6 +542,7 @@ async def test_a_missing_document_is_tried_again_once_it_is_back(
     path.unlink()
     report = await index_library(library, FakeEmbedder())
     assert report.failed == [(paper.file_id, "missing from the store")]
+    # Not indexed before, so nothing to keep; see the test below for that.
     report = await index_library(library, FakeEmbedder())
     assert report.failed == [] and report.unchanged == 1
 
@@ -610,3 +612,73 @@ def test_budget_shows_and_resets_the_embedding_ledger(
     assert "embeddings" in result.output and "1234" in result.output
     CliRunner().invoke(app, ["budget", "--reset"])
     assert semantic.embedding_budget().usage().tokens == 0
+
+
+# ---- third review -----------------------------------------------------------------
+
+
+async def test_a_document_missing_for_one_pass_keeps_its_chunks(
+    settings: Settings, library: Library
+) -> None:
+    """An unmounted store must not cost the library its embeddings."""
+    import dataclasses
+
+    await _file(settings, library, a="reward shaping")
+    await index_library(library, FakeEmbedder())
+    (paper,) = library.db.all_papers()
+    # Retitled, so the pass looks at it again -- and finds the file gone.
+    library.db.upsert(dataclasses.replace(paper, title="Renamed"))
+    path = library.store_path(paper)
+    kept = path.read_bytes()
+    path.unlink()
+    await index_library(library, FakeEmbedder())
+    assert await search(library, FakeEmbedder(), "reward shaping")
+
+    path.write_bytes(kept)
+    report = await index_library(library, FakeEmbedder())
+    assert report.indexed == [paper.file_id]
+
+
+async def test_a_pdf_that_could_not_be_read_just_now_is_tried_again(
+    settings: Settings, library: Library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sortyourpaperya.extract import ExtractionError
+
+    await _file(settings, library, a="reward shaping")
+    real = semantic._read_store
+
+    def flaky(path):
+        raise ExtractionError("could not read a.pdf: I/O error") from OSError(5, "EIO")
+
+    monkeypatch.setattr(semantic, "_read_store", flaky)
+    assert len((await index_library(library, FakeEmbedder())).failed) == 1
+    monkeypatch.setattr(semantic, "_read_store", real)
+    assert len((await index_library(library, FakeEmbedder())).indexed) == 1
+
+
+async def test_a_batch_that_times_out_is_split_before_the_pass_stops(
+    settings: Settings, library: Library
+) -> None:
+    """Too big together is not too big alone; only a lone failure stops."""
+    await _file(settings, library, a="reward shaping", b="dopamine error")
+
+    class Choking(FakeEmbedder):
+        async def embed(self, texts):
+            if len(texts) > 1:
+                raise LlmError("embedding request failed: timed out")
+            return await super().embed(texts)
+
+    report = await index_library(library, Choking())
+    assert len(report.indexed) == 2 and report.stopped is None
+
+
+def test_a_refused_key_is_not_read_again_on_every_request() -> None:
+    """A key still wrong is refused by every request; one dialog, not N."""
+    from sortyourpaperya import config
+    from sortyourpaperya.llm import key_refused
+
+    before = config.key_generation()
+    refused = type("E", (Exception,), {"status_code": 401})()
+    for _ in range(5):
+        key_refused(refused)
+    assert config.key_generation() == before + 1

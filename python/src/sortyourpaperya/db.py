@@ -706,10 +706,9 @@ class PaperDb:
     ) -> None:
         """Swap one source's chunks for these, each `(position, page, text, embedding)`.
 
-        An empty `chunks` is still recorded: a scan nobody has read, a PDF that
-        will not parse, have no text to embed, and remembering that is what
-        stops every later pass from opening them again to find the same nothing.
-        Their fingerprints say so; see `semantic.UNREADABLE`.
+        An empty `chunks` is still recorded: an empty note has no text to embed,
+        and remembering that is what stops every later pass from opening it
+        again to find the same nothing.
         """
         with self._transaction():
             self._conn.execute(
@@ -738,6 +737,24 @@ class PaperDb:
                     indexed_at_ms = excluded.indexed_at_ms
                 """,
                 [file_id, source, fingerprint, model, len(chunks), now_ms()],
+            )
+
+    def mark_text_source(self, file_id: str, source: str, fingerprint: str) -> None:
+        """Record a fingerprint for a source without touching its chunks.
+
+        For a document that has nothing to embed just now -- see
+        `semantic.UNREADABLE`. Its chunks stay: a store on a drive that was not
+        mounted for one pass must not cost the whole library its embeddings.
+        """
+        with self._transaction():
+            self._conn.execute(
+                """
+                INSERT INTO text_sources VALUES (?, ?, ?, '', 0, ?)
+                ON CONFLICT (file_id, source) DO UPDATE SET
+                    fingerprint = excluded.fingerprint,
+                    indexed_at_ms = excluded.indexed_at_ms
+                """,
+                [file_id, source, fingerprint, now_ms()],
             )
 
     def drop_text_source(self, file_id: str, source: str) -> None:

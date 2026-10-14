@@ -1793,7 +1793,7 @@ def budget(
     )
     if limits.unlimited:
         typer.echo(
-            "\nboth ceilings are off. The watcher restarts on failure, so "
+            "\nboth chat ceilings are off. The watcher restarts on failure, so "
             "nothing here would stop a loop paying for the same folder."
         )
     else:
@@ -1801,6 +1801,7 @@ def budget(
             "\nraise with SYP_MAX_REQUESTS_PER_DAY / SYP_MAX_TOKENS_PER_DAY; "
             "0 turns a ceiling off."
         )
+    typer.echo("embeddings: SYP_MAX_EMBEDDING_TOKENS_PER_DAY, 0 for no ceiling.")
 
 
 def _ceiling(limit: int) -> str:

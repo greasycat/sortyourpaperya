@@ -209,15 +209,25 @@ def _key_changed() -> None:
     _CACHED_KEY = (-1, None)
 
 
+# When a refused key may next be read again; see `forget_cached_key`.
+_REREAD_AFTER = 0.0
+
+
 def forget_cached_key() -> None:
-    """Read the key afresh next time: the API has just refused this one.
+    """Read the key afresh, at most once a `KEY_MISS_SECONDS`: the API refused it.
 
     A key found in the keychain is otherwise believed until `login` or
     `logout` -- but it can be rotated in the keyring itself, or stored by a
     `login` that never reached this process, and a watcher holding the old one
     would fail every request until restarted. A refusal is the one sign that
-    the cached key is wrong, and it costs one keychain read to act on.
+    the cached key is wrong. Rate-limited, because a key that is still wrong
+    is refused by every request of a pass, and a keyring that confirms per
+    access would put a dialog in front of each one.
     """
+    global _REREAD_AFTER
+    if monotonic() < _REREAD_AFTER:
+        return
+    _REREAD_AFTER = monotonic() + KEY_MISS_SECONDS
     _key_changed()
 
 
