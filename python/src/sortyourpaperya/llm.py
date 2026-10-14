@@ -26,8 +26,12 @@ class LlmError(RuntimeError):
     """Raised when the model call fails or its response cannot be used."""
 
 
-def key_refused(err: BaseException) -> None:
-    """Drop the cached key if `err` is the API refusing it; see `forget_cached_key`."""
+def key_refused(err: BaseException | None) -> None:
+    """Drop the cached key if `err` is the API refusing it; see `forget_cached_key`.
+
+    Called by the lazy clients, the only ones that read the cached key: one
+    built on a key it was handed has nothing to forget.
+    """
     if getattr(err, "status_code", None) == 401:
         from .config import forget_cached_key
 
@@ -467,7 +471,6 @@ class OpenAiClient:
                 },
             )
         except Exception as err:  # surface SDK/transport failures uniformly
-            key_refused(err)
             raise LlmError(f"model request failed: {err}") from err
 
         self._record_tokens(response)
@@ -515,7 +518,6 @@ class OpenAiClient:
                 },
             )
         except Exception as err:  # surface SDK/transport failures uniformly
-            key_refused(err)
             raise LlmError(f"category request failed: {err}") from err
 
         self._record_tokens(response)
@@ -552,7 +554,6 @@ class OpenAiClient:
                 ],
             )
         except Exception as err:  # surface SDK/transport failures uniformly
-            key_refused(err)
             raise LlmError(f"page-reading request failed: {err}") from err
 
         self._record_tokens(response)
@@ -620,11 +621,18 @@ class LazyOpenAiClient:
             )
         return self._client
 
+    async def _call(self, name: str, *args, **kwargs):
+        try:
+            return await getattr(self._resolved(), name)(*args, **kwargs)
+        except LlmError as err:
+            key_refused(err.__cause__)
+            raise
+
     async def extract_keywords(self, *args, **kwargs):
-        return await self._resolved().extract_keywords(*args, **kwargs)
+        return await self._call("extract_keywords", *args, **kwargs)
 
     async def describe_pages(self, *args, **kwargs):
-        return await self._resolved().describe_pages(*args, **kwargs)
+        return await self._call("describe_pages", *args, **kwargs)
 
     async def suggest_category(self, *args, **kwargs):
-        return await self._resolved().suggest_category(*args, **kwargs)
+        return await self._call("suggest_category", *args, **kwargs)

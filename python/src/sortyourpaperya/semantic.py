@@ -252,7 +252,6 @@ class OpenAiEmbedder:
                     model=self._model, input=batch
                 )
             except Exception as err:  # surface SDK/transport failures uniformly
-                key_refused(err)
                 if getattr(err, "status_code", None) in (400, 413, 422):
                     raise EmbeddingRejected(f"embedding request refused: {err}") from err
                 raise LlmError(f"embedding request failed: {err}") from err
@@ -307,7 +306,11 @@ class LazyOpenAiEmbedder:
             self._embedder = OpenAiEmbedder(
                 resolve_api_key(), self._model, budget=self._budget
             )
-        return await self._embedder.embed(texts)
+        try:
+            return await self._embedder.embed(texts)
+        except LlmError as err:
+            key_refused(err.__cause__)
+            raise
 
 
 # ---- indexing ---------------------------------------------------------------

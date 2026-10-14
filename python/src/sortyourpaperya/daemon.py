@@ -181,7 +181,7 @@ async def _ingest(library: Library, args: dict[str, Any], emit: Emit) -> Any:
     from .config import resolve_api_key, resolve_settings
     from .ingest import ingest_folder
     from .library import FilingMode
-    from .llm import OpenAiClient
+    from .llm import LazyOpenAiClient
 
     settings = resolve_settings(
         Path(args["input_dir"]),
@@ -191,7 +191,10 @@ async def _ingest(library: Library, args: dict[str, Any], emit: Emit) -> Any:
     )
     mode = FilingMode(args.get("mode", FilingMode.PREVIEW.value))
     await emit(protocol.event("started", input=str(settings.input_dir), mode=mode.value))
-    client = OpenAiClient(resolve_api_key(), settings.model)
+    # No key is an answer for the whole op, not a failure per document.
+    resolve_api_key()
+    # Lazy, as the watcher's own is: it is what drops a key the API refuses.
+    client = LazyOpenAiClient(settings.model)
     report = await ingest_folder(settings, client, library, mode=mode)
     return protocol.dump(report)
 
