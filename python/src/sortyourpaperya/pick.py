@@ -12,6 +12,7 @@ its key bindings from there, so nothing in the drawing half changes.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -28,6 +29,11 @@ from .naming import split_category
 # you have to scroll is one people stop reading, which is the opposite of what a
 # confirmation is for.
 CONFIRM_NAMES = 8
+
+# How long a started command is watched for failing before it is left running.
+# Long enough for a mistyped one to come back 127, short enough that a viewer
+# that stays open is not waited on.
+SPAWN_GRACE = 0.05
 
 # The branch untagged documents are shown under. A label and not a folder: they
 # link at the top of the tree, which is where opening this branch goes.
@@ -287,20 +293,27 @@ def _spawn(command: list[str] | str, path: str | None = None, **kwargs) -> None:
         )
     except OSError as err:  # no xdg-open on a machine with no desktop
         raise LibraryError(f"could not run {shown}: {err}") from err
+    refused: OSError | None = None
     if path is not None:
         try:
             process.stdin.write(f"{path}\n")
+            process.stdin.close()  # flushes, so a closed pipe can surface here too
         except OSError as err:  # a command that exits before it reads
-            raise LibraryError(f"{shown} did not take the path: {err}") from err
-        finally:
-            process.stdin.close()
-    # A moment, and only a moment: long enough for a mistyped command to come
-    # back 127 and be reported as the failure it is, short enough that a reader
-    # that stays open is not waited on. Still running is the answer we want.
+            refused = err
+            with contextlib.suppress(OSError):
+                process.stdin.close()
+    # Still running after the grace period is the answer we want.
     try:
-        status = process.wait(timeout=0.05)
+        status = process.wait(timeout=SPAWN_GRACE)
     except subprocess.TimeoutExpired:
+        if refused is not None:
+            raise LibraryError(f"{shown} did not take the path: {refused}") from refused
         return
+    # A command that died before reading the path also breaks the pipe, and
+    # which of the two is noticed first is a race. Its status is the cause, so
+    # it is what gets reported; the broken pipe is only the symptom.
+    if status == 0 and refused is not None:
+        raise LibraryError(f"{shown} did not take the path: {refused}") from refused
     if status != 0:
         raise LibraryError(f"{shown} exited with status {status}")
 

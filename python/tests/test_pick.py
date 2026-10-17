@@ -460,10 +460,17 @@ def test_opening_takes_no_write_lock() -> None:
 
 
 def test_a_mistyped_command_is_reported_rather_than_counted_as_done(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A shell starts happily whatever you type; the failure arrives after. Long
-    enough to catch that, short enough not to wait on a reader that stays open."""
+    enough to catch that, short enough not to wait on a reader that stays open.
+
+    The grace is widened here: the shell exiting inside 50 ms is the common case,
+    not a promise, and a busy machine is not a broken command. Either way the
+    shell may exit before the path is written, and its status, not the broken
+    pipe, is what must be reported.
+    """
+    monkeypatch.setattr(pick, "SPAWN_GRACE", 5.0)
     library = Library(tmp_path / "lib")
     _, chosen = _fill(library)
     paper = chosen[0]
@@ -697,3 +704,28 @@ def test_the_author_and_the_year_are_searchable(monkeypatch) -> None:
     hidden, *searched = shown["line"].split("\t")
     assert hidden == "abc123"  # read back from, never shown
     assert "Donald Knuth" in searched and "1984" in searched
+
+
+@pytest.mark.parametrize(("status", "said"), [(127, "status 127"), (0, "did not take")])
+def test_a_command_gone_before_the_path_reports_its_status(
+    monkeypatch: pytest.MonkeyPatch, status: int, said: str
+) -> None:
+    """The broken pipe is the symptom; a failing status is the cause. Forced
+    here, since against a real shell which is noticed first is a race."""
+
+    class Gone:
+        def write(self, _text):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def close(self):
+            pass
+
+    class Process:
+        stdin = Gone()
+
+        def wait(self, timeout):
+            return status
+
+    monkeypatch.setattr(pick.subprocess, "Popen", lambda cmd, **kw: Process())
+    with pytest.raises(LibraryError, match=said):
+        pick._spawn("whatever", "/some/path")
