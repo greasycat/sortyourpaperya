@@ -5,6 +5,7 @@ A bibliography is a folder under `<library>/bibs/<slug>/`:
     bib.toml          the record, and the one you edit
     references.bib    generated from it, and the one LaTeX reads
     notes.md          about the manuscript; any markdown or JSON file is one
+    reading.toml      what to read first, and why; see `reading`
     notes/<key>.md    about one thing it cites, in this manuscript
     knuth_1984/       a cited book, linked in so it is at hand while writing
 
