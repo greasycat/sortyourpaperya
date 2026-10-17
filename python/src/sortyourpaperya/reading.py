@@ -33,6 +33,7 @@ left off, and is then the item's position.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tomllib
@@ -93,17 +94,23 @@ def load(bibliography: Bibliography) -> ReadingList | None:
     except (OSError, tomllib.TOMLDecodeError) as err:
         raise BibError(f"could not read {path}: {err}") from err
 
+    declared = raw.get("entry") or []
+    if not isinstance(declared, list):
+        raise BibError(f"{path}: `entry` must be a list of [[entry]] tables")
     entries = []
-    for position, body in enumerate(raw.get("entry") or [], start=1):
+    for position, body in enumerate(declared, start=1):
         if not isinstance(body, dict) or not str(body.get("key") or "").strip():
             raise BibError(f"{path}: entry {position} has no `key`")
+        rank = body.get("rank", position)
+        if isinstance(rank, bool) or not isinstance(rank, int):
+            raise BibError(f"{path}: entry {position} has a `rank` that is not a number")
         read_at = body.get("read_at_ms")
         entries.append(
             Entry(
                 key=str(body["key"]),
-                rank=int(body.get("rank") or position),
+                rank=rank,
                 rationale=str(body.get("rationale") or ""),
-                chain_of_thought=[str(s) for s in body.get("chain_of_thought") or []],
+                chain_of_thought=_stored_steps(body.get("chain_of_thought"), path),
                 read_at_ms=read_at if isinstance(read_at, int) else None,
             )
         )
@@ -111,9 +118,20 @@ def load(bibliography: Bibliography) -> ReadingList | None:
     updated = raw.get("updated_at_ms")
     return ReadingList(
         entries=entries,
-        chain_of_thought=[str(s) for s in raw.get("chain_of_thought") or []],
+        chain_of_thought=_stored_steps(raw.get("chain_of_thought"), path),
         updated_at_ms=updated if isinstance(updated, int) else 0,
     )
+
+
+def _stored_steps(value: object, path: Path) -> list[str]:
+    """Steps as written in the file; a lone string is one step, not one per letter."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        raise BibError(f"{path}: `chain_of_thought` must be a list of strings")
+    return [str(step) for step in value]
 
 
 def save(bibliography: Bibliography, reading: ReadingList) -> Path:
@@ -135,9 +153,14 @@ def save(bibliography: Bibliography, reading: ReadingList) -> Path:
     if tables:
         document["entry"] = tables
     path = reading_path(bibliography)
+    # Written beside and renamed over, so a reader -- the screen, an agent's
+    # `--json` -- never meets a half-written list, and an interruption leaves
+    # the old one rather than an empty file.
+    staged = path.with_name(f".{path.name}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(tomli_w.dumps(document), encoding="utf-8")
+        staged.write_text(tomli_w.dumps(document), encoding="utf-8")
+        os.replace(staged, path)
     except OSError as err:
         raise BibError(f"could not write {path}: {err}") from err
     return path
@@ -253,6 +276,24 @@ def unranked(bibliography: Bibliography, reading: ReadingList | None) -> list[st
     """The keys the bibliography cites that the list does not place."""
     placed = {e.key for e in reading.entries} if reading else set()
     return [s.key for s in bibliography.sources if s.key not in placed]
+
+
+def mark(bibliography: Bibliography, key: str) -> ReadingList:
+    """Toggle one entry read in the list as it is on disk now, and save it.
+
+    Re-read rather than written from memory: the list may be open on a screen
+    while an agent replaces it, and writing the screen's copy back would undo
+    the agent's ranking for the sake of one checkbox.
+
+    Raises:
+        BibError: if the list is gone, unreadable, or no longer has the entry.
+    """
+    current = load(bibliography)
+    if current is None:
+        raise BibError("the reading list is gone")
+    toggle_read(current, key)
+    save(bibliography, current)
+    return current
 
 
 def toggle_read(reading: ReadingList, key: str) -> Entry:
@@ -411,12 +452,12 @@ def run(
     bibliography: Bibliography,
     reading: ReadingList,
     open_entry: Callable[[Entry], None],
-    persist: Callable[[ReadingList], None],
 ) -> None:
     """Show the list until asked to stop.
 
-    `open_entry` opens an entry's document and `persist` writes the list after
-    one is marked; both are the caller's, which knows where the library is.
+    `open_entry` opens an entry's document, and is the caller's, which knows
+    where the library is. Marking an entry re-reads the list from disk, so an
+    agent's new ranking written meanwhile shows up rather than being undone.
     """
     import termios
     import tty
@@ -451,8 +492,10 @@ def run(
                         open_entry(entry)
                         screen.message = f"opened {entry.key}"
                     else:
-                        toggle_read(reading, entry.key)
-                        persist(reading)
+                        screen.reading = mark(bibliography, entry.key)
+                        screen.cursor = min(
+                            screen.cursor, max(0, len(screen.reading.entries) - 1)
+                        )
                 except Exception as err:  # noqa: BLE001 -- shown, not raised
                     screen.message = f"{entry.key}: {err}"
     except KeyboardInterrupt:

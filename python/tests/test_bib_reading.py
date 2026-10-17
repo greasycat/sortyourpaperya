@@ -133,3 +133,41 @@ def test_text_numbers_the_reasoning(thesis) -> None:
     assert "[ ] 1. devlin2019bert  BERT (Author, 2020)" in text
     assert "      1. a\n      2. b" in text
     assert "not ranked: vaswani2017attention, brown2020language" in text
+
+
+def test_marking_read_keeps_a_ranking_written_meanwhile(thesis) -> None:
+    """A screen open on the old list must not undo the agent's new one."""
+    old = reading.from_agent(thesis, {"items": [_item("devlin2019bert")]}, None)
+    reading.save(thesis, old)
+    reading.save(
+        thesis,
+        reading.from_agent(
+            thesis, {"items": [_item("brown2020language"), _item("devlin2019bert")]}, old
+        ),
+    )
+
+    marked = reading.mark(thesis, "devlin2019bert")
+
+    assert [e.key for e in marked.entries] == ["brown2020language", "devlin2019bert"]
+    assert reading.load(thesis).entry("devlin2019bert").read_at_ms is not None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'entry = "x"',
+        '[[entry]]\nkey = "a"\nrank = "first"',
+        '[[entry]]\nkey = "a"\nchain_of_thought = 3',
+    ],
+)
+def test_a_hand_broken_list_is_a_bib_error(thesis, body) -> None:
+    reading.reading_path(thesis).write_text(body)
+    with pytest.raises(BibError):
+        reading.load(thesis)
+
+
+def test_a_lone_string_step_is_one_step(thesis) -> None:
+    reading.reading_path(thesis).write_text(
+        '[[entry]]\nkey = "devlin2019bert"\nchain_of_thought = "one step"'
+    )
+    assert reading.load(thesis).entries[0].chain_of_thought == ["one step"]

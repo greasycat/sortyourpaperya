@@ -1518,3 +1518,20 @@ def test_bib_reading_agent_refuses_bad_json_and_ambiguity(library) -> None:
 
     empty = _invoke(root, "bib", "reading", "--lib", "thesis")
     assert "no reading list yet" in empty.stdout
+
+
+def test_bib_reading_agent_replaces_a_broken_list(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+    (root / "bibs" / "thesis" / "reading.toml").write_text("not = [toml")
+    payload = {"items": [{"cite": paper.file_id, "rationale": "r", "chain_of_thought": ["a"]}]}
+
+    written = _invoke(root, "bib", "reading", "--agent", input=json.dumps(payload))
+
+    assert written.exit_code == 0, written.output
+    assert "without its read marks" in written.stderr
+
+    stray = _invoke(root, "bib", "reading", "--from", "x.json")
+    assert stray.exit_code == 2
+    assert "needs --agent" in stray.stderr

@@ -1087,8 +1087,17 @@ def bib_reading(
     from . import reading as readings
 
     settings = _settings(None, library_dir)
+    if from_file is not None and not agent:
+        typer.echo("error: --from is the agent's list, and needs --agent", err=True)
+        raise typer.Exit(code=2)
 
     if agent:
+        if from_file is None and sys.stdin.isatty():
+            typer.echo(
+                "error: --agent reads the list on stdin; pipe it in or pass --from",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         bibliography = _agent_bib(settings.output_dir, lib)
         try:
             raw = from_file.read_text(encoding="utf-8") if from_file else sys.stdin.read()
@@ -1097,9 +1106,14 @@ def bib_reading(
             typer.echo(f"error: could not read the reading list: {err}", err=True)
             raise typer.Exit(code=1) from err
         try:
-            made = readings.from_agent(
-                bibliography, payload, readings.load(bibliography)
-            )
+            previous = readings.load(bibliography)
+        except BibError as err:
+            # The agent is here to replace the list; a broken one must not stop
+            # it. Only what was marked read is lost, and that is said.
+            typer.echo(f"  {err}; replacing it without its read marks", err=True)
+            previous = None
+        try:
+            made = readings.from_agent(bibliography, payload, previous)
             path = readings.save(bibliography, made)
         except BibError as err:
             typer.echo(f"error: {err}", err=True)
@@ -1145,12 +1159,7 @@ def bib_reading(
             path = picker._path(library, paper)
         picker._spawn([picker.viewer(), path])
 
-    readings.run(
-        bibliography,
-        current,
-        open_entry,
-        lambda changed: readings.save(bibliography, changed),
-    )
+    readings.run(bibliography, current, open_entry)
 
 
 def _agent_bib(library_root: Path, needle: str | None) -> Bibliography:
