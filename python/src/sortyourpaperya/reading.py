@@ -156,12 +156,15 @@ def save(bibliography: Bibliography, reading: ReadingList) -> Path:
     # Written beside and renamed over, so a reader -- the screen, an agent's
     # `--json` -- never meets a half-written list, and an interruption leaves
     # the old one rather than an empty file.
-    staged = path.with_name(f".{path.name}.tmp")
+    # Named per process, so two writers at once -- an agent and the screen --
+    # cannot rename each other's half-written file into place.
+    staged = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         staged.write_text(tomli_w.dumps(document), encoding="utf-8")
         os.replace(staged, path)
     except OSError as err:
+        staged.unlink(missing_ok=True)
         raise BibError(f"could not write {path}: {err}") from err
     return path
 
@@ -493,9 +496,10 @@ def run(
                         screen.message = f"opened {entry.key}"
                     else:
                         screen.reading = mark(bibliography, entry.key)
-                        screen.cursor = min(
-                            screen.cursor, max(0, len(screen.reading.entries) - 1)
-                        )
+                        # Follow the entry: the list may have been re-ranked
+                        # under the screen, and the row number with it.
+                        keys = [e.key for e in screen.reading.entries]
+                        screen.cursor = keys.index(entry.key)
                 except Exception as err:  # noqa: BLE001 -- shown, not raised
                     screen.message = f"{entry.key}: {err}"
     except KeyboardInterrupt:
