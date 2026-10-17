@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from logging.handlers import RotatingFileHandler
@@ -1469,3 +1470,51 @@ def test_a_page_of_records_reads_the_bibliographies_once(library, monkeypatch) -
 
     assert result.exit_code == 0, result.output
     assert len(reads) == 1
+
+
+def test_bib_reading_agent_then_json(library) -> None:
+    root, paper = _cited(library)
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "add", "--lib", "thesis", "--cite", paper.file_id)
+    payload = {
+        "chain_of_thought": ["the base paper first"],
+        "items": [{"cite": paper.file_id, "rank": 1, "rationale": "the base", "chain_of_thought": ["a", "b"]}],
+    }
+
+    # One bibliography, so --lib may be left off: stdin is the list.
+    written = _invoke(root, "bib", "reading", "--agent", input=json.dumps(payload))
+    assert written.exit_code == 0, written.output
+    assert "wrote 1 to read" in written.stdout
+
+    shown = _invoke(root, "bib", "reading", "--lib", "thesis", "--json")
+    assert shown.exit_code == 0, shown.output
+    record = json.loads(shown.stdout)
+    assert record["chain_of_thought"] == ["the base paper first"]
+    [item] = record["items"]
+    assert item["key"] == "vaswani2017attention"
+    assert item["file_id"] == paper.file_id
+    assert item["path"].endswith(paper.document_name)
+    assert item["chain_of_thought"] == ["a", "b"]
+    assert record["unranked"] == []
+
+    # Off a terminal the list is printed rather than drawn.
+    printed = _invoke(root, "bib", "reading", "--lib", "thesis")
+    assert "1. vaswani2017attention" in printed.stdout
+
+
+def test_bib_reading_agent_refuses_bad_json_and_ambiguity(library) -> None:
+    root = library.root
+    library.close()
+    _invoke(root, "bib", "init", "Thesis")
+    _invoke(root, "bib", "init", "Paper")
+
+    unnamed = _invoke(root, "bib", "reading", "--agent", input="{}")
+    assert unnamed.exit_code == 1
+    assert "--lib" in unnamed.stderr
+
+    broken = _invoke(root, "bib", "reading", "--lib", "thesis", "--agent", input="{")
+    assert broken.exit_code == 1
+    assert "could not read" in broken.stderr
+
+    empty = _invoke(root, "bib", "reading", "--lib", "thesis")
+    assert "no reading list yet" in empty.stdout

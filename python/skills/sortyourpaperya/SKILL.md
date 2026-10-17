@@ -241,6 +241,38 @@ Citing the same document twice does nothing and says so; it does not duplicate
 the entry. `sortyourpaperya bib init "<name>"` starts a new bibliography, one
 per manuscript.
 
+### Reading list
+
+When the user asks what to read first for a manuscript, rank what the
+bibliography cites and write it with `bib reading --agent`. Read the sources
+first (`bib reading --json` lists what is `unranked`, `find --json`, notes), then
+hand over every item with a one-line `rationale` and the `chain_of_thought` that
+put it at that rank — short steps in order, unnumbered (the list numbers them).
+Add a top-level `chain_of_thought` for how the list as a whole was ordered.
+
+```bash
+sortyourpaperya bib reading --lib thesis --agent <<'JSON'
+{"chain_of_thought": ["foundations before extensions", "then what chapter 3 argues against"],
+ "items": [
+   {"cite": "vaswani2017attention", "rank": 1,
+    "rationale": "Defines the architecture every other source modifies.",
+    "chain_of_thought": ["Both later sources cite it as their base", "Short and self-contained"]},
+   {"cite": "devlin2019bert", "rank": 2,
+    "rationale": "The encoder-only variant chapter 3 builds on.",
+    "chain_of_thought": ["Assumes self-attention from rank 1", "Needed before the fine-tuning papers"]}
+ ]}
+JSON
+sortyourpaperya bib reading --lib thesis --json    # read it back
+```
+
+`cite` is a citation key or `file_id` already in that bibliography, matched
+exactly — `bib add` it first. Ranks must be distinct and are renumbered 1..n. The
+whole list is replaced each time, so always send every item you rank; what the
+user marked read is kept. A bad item refuses the whole list with a message naming
+it. `--lib` may be left off only when the library has one bibliography. Without
+`--agent` or `--json` on a terminal it opens an interactive list for the user —
+do not run that yourself.
+
 To ask it the other way round — where have I already used this document —
 `sortyourpaperya cited <id>` names every bibliography citing it and the key each
 uses, and every `find --json` and `list --json` record carries the same under
@@ -316,7 +348,7 @@ and when a pass is holding it, asks the watcher instead.
   `--yes` only after the user has said yes to that document, and only with an
   exact id — `--yes` refuses words, because what a word matches changes as the
   library grows.
-- `sortyourpaperya bib init`, `bib add`, and `bib note` write inside `bibs/`,
+- `sortyourpaperya bib init`, `bib add`, `bib note`, and `bib reading --agent` write inside `bibs/`,
   and `--link` writes one symlink into the current directory. A bibliography is
   the user's manuscript: run them when asked, not to tidy up.
 - `sortyourpaperya fsck`, `scan`, `tree`, `migrate-store`, and `backup` are maintenance.

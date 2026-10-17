@@ -573,6 +573,32 @@ rebuild. A page of records reads the bibliographies once, not once per row.
 A source with no `file_id` — a book cited by hand, something not in this library
 — cites no document here and appears nowhere in the answer.
 
+### A reading list: what to read first, and why
+
+```bash
+sortyourpaperya bib reading --lib thesis --agent < list.json   # an agent ranks what it cites
+sortyourpaperya bib reading --lib thesis                       # walk it: enter why, o open, x read
+sortyourpaperya bib reading --lib thesis --json                # ...or print it for a program
+```
+
+An agent ranks what a bibliography cites and hands the list over as JSON: a
+one-line `rationale` per item and the `chain_of_thought` that put it there, as
+steps the list numbers when it shows them. A `chain_of_thought` at the top says
+how the list as a whole was ordered.
+
+```json
+{"chain_of_thought": ["foundations before extensions"],
+ "items": [{"cite": "vaswani2017attention", "rank": 1,
+            "rationale": "defines the architecture the rest modify",
+            "chain_of_thought": ["every later source cites it", "short and self-contained"]}]}
+```
+
+`cite` is a citation key or a `file_id` the bibliography already cites, matched
+exactly; `rank` may be left off and is then the position. A list with one bad
+item is refused whole. Each `--agent` replaces the list — a ranking is a
+judgement about all of it — but what you have marked read is kept. It is stored
+as `bibs/<slug>/reading.toml`, not JSON, so it is not mistaken for a note.
+
 ### Notes on the manuscript, and on what it cites
 
 ```bash
@@ -797,6 +823,7 @@ sortyourpaperya bib note --lib thesis --path      # notes on the manuscript
 sortyourpaperya bib note --lib thesis --cite <id> --path   # ...on one cited source
 sortyourpaperya bib add                           # ...or be asked which, and which
 sortyourpaperya bib build --lib thesis            # re-generate the .bib from bib.toml
+sortyourpaperya bib reading --lib thesis          # its reading list; --agent writes one, --json prints it
 sortyourpaperya bib list                          # every bibliography in the library
 sortyourpaperya cited <id>                        # which bibliographies cite a document
 sortyourpaperya remove <id>                       # delete link, folder, and record (asks first)

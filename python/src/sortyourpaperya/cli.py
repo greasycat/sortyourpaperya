@@ -1049,6 +1049,174 @@ def bib_note(
     _open_or_print(path, path_only)
 
 
+@bib_app.command("reading")
+def bib_reading(
+    lib: str = typer.Option(
+        None, "--lib", help="Which bibliography, by slug or id. Asked for if left out."
+    ),
+    agent: bool = typer.Option(
+        False,
+        "--agent",
+        help="Replace the list with the JSON an agent writes on stdin (or --from).",
+    ),
+    from_file: Path = typer.Option(
+        None, "--from", help="With --agent, read the JSON from this file instead of stdin."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the list as JSON instead of showing it."
+    ),
+    library_dir: Path = typer.Option(None, "--library", "-o", help="Library folder."),
+) -> None:
+    """A bibliography's reading list: what to read first, and why.
+
+    An agent writes it with `--agent`, handing over JSON that ranks what the
+    bibliography cites, gives each a one-line rationale, and shows the chain of
+    thought behind its place as numbered steps:
+
+        {"chain_of_thought": ["how the whole list was ordered", ...],
+         "items": [{"cite": "<key or file_id>", "rank": 1,
+                    "rationale": "why this one first",
+                    "chain_of_thought": ["step", "step", ...]}]}
+
+    The list is replaced whole each time; what has been marked read is kept.
+
+    Without `--agent` it is shown: on a terminal, as a list to walk (enter shows
+    the reasoning, o opens the document, x marks it read); otherwise, or with
+    `--json`, printed.
+    """
+    from . import reading as readings
+
+    settings = _settings(None, library_dir)
+
+    if agent:
+        bibliography = _agent_bib(settings.output_dir, lib)
+        try:
+            raw = from_file.read_text(encoding="utf-8") if from_file else sys.stdin.read()
+            payload = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as err:
+            typer.echo(f"error: could not read the reading list: {err}", err=True)
+            raise typer.Exit(code=1) from err
+        try:
+            made = readings.from_agent(
+                bibliography, payload, readings.load(bibliography)
+            )
+            path = readings.save(bibliography, made)
+        except BibError as err:
+            typer.echo(f"error: {err}", err=True)
+            raise typer.Exit(code=1) from err
+        typer.echo(f"wrote {len(made.entries)} to read to {path}")
+        left = readings.unranked(bibliography, made)
+        if left:
+            typer.echo(f"  not ranked: {', '.join(left)}", err=True)
+        return
+
+    bibliography = _pick_bib(settings.output_dir, lib)
+    try:
+        current = readings.load(bibliography)
+    except BibError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+    if as_json:
+        typer.echo(
+            json.dumps(_reading_record(settings.output_dir, bibliography, current), indent=2)
+        )
+        return
+    if current is None or not current.entries:
+        typer.echo(
+            f"{bibliography.slug} has no reading list yet; an agent writes one with "
+            f"`sortyourpaperya bib reading --lib {bibliography.slug} --agent < list.json`"
+        )
+        return
+    if not _interactive():
+        typer.echo(readings.as_text(bibliography, current))
+        return
+
+    def open_entry(entry) -> None:
+        from . import pick as picker
+
+        source = next((s for s in bibliography.sources if s.key == entry.key), None)
+        if source is None or not source.file_id:
+            raise LibraryError(f"{entry.key} is not a document in this library")
+        with _reading(settings.output_dir) as library:
+            paper = library.db.get(source.file_id)
+            if paper is None:
+                raise LibraryError(f"{source.file_id} has left the library")
+            path = picker._path(library, paper)
+        picker._spawn([picker.viewer(), path])
+
+    readings.run(
+        bibliography,
+        current,
+        open_entry,
+        lambda changed: readings.save(bibliography, changed),
+    )
+
+
+def _agent_bib(library_root: Path, needle: str | None) -> Bibliography:
+    """The bibliography an agent's list is for, never asked for.
+
+    Stdin is the list, so there is nobody to answer a question on it: a library
+    with one bibliography needs no `--lib`, and one with several must be told.
+    """
+    if needle:
+        return _pick_bib(library_root, needle)
+    found = bibs.all_bibs(library_root)
+    if len(found) == 1:
+        return found[0]
+    typer.echo(
+        "error: --agent needs --lib when the library has "
+        + ("no bibliography" if not found else "several bibliographies"),
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
+def _reading_record(library_root: Path, bibliography: Bibliography, current) -> dict:
+    """The reading list as JSON, with each entry's document and path filled in."""
+    from . import reading as readings
+
+    sources = {s.key: s for s in bibliography.sources}
+    entries = current.entries if current else []
+    paths: dict[str, str] = {}
+    wanted = [sources[e.key].file_id for e in entries if e.key in sources]
+    wanted = [file_id for file_id in wanted if file_id]
+    if wanted:
+        with _reading(library_root) as library:
+            for file_id in wanted:
+                paper = library.db.get(file_id)
+                if paper is not None:
+                    paths[file_id] = str(library.store_path(paper))
+
+    items = []
+    for entry in entries:
+        source = sources.get(entry.key)
+        file_id = source.file_id if source else None
+        items.append(
+            {
+                "rank": entry.rank,
+                "key": entry.key,
+                "file_id": file_id,
+                "title": source.fields.get("title") if source else None,
+                "authors": source.fields.get("author") if source else None,
+                "year": source.fields.get("year") if source else None,
+                "cited": source is not None,
+                "path": paths.get(file_id) if file_id else None,
+                "rationale": entry.rationale,
+                "chain_of_thought": entry.chain_of_thought,
+                "read_at": _timestamp(entry.read_at_ms),
+            }
+        )
+    return {
+        "bib": {"id": bibliography.id, "slug": bibliography.slug, "name": bibliography.name},
+        "path": str(readings.reading_path(bibliography)),
+        "updated_at": _timestamp(current.updated_at_ms or None) if current else None,
+        "chain_of_thought": current.chain_of_thought if current else [],
+        "items": items,
+        "unranked": readings.unranked(bibliography, current),
+    }
+
+
 def _one_note(existing: list[Path], name: str | None, at, subject: str) -> Path:
     """The note a command should open: the named one, or the only one there is.
 
