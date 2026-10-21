@@ -960,3 +960,26 @@ def test_p_at_the_fzf_prompt_goes_to_the_notes(
     )
 
     assert went["chosen"] == papers[:2]
+
+
+def test_the_title_comes_before_the_authors_in_fzf(monkeypatch) -> None:
+    """Three papers by one group, led by the author list, were cut off by the
+    terminal before anything told them apart."""
+    paper = Paper(
+        file_id="abc123",
+        content_hash="h",
+        store_name="abc123__Psychology",
+        title="Automated decision aids",
+        authors=["Luke Strickland", "Russell J. Boag", "Andrew Heathcote"],
+        tags=["Psychology"],
+    )
+    shown = {}
+
+    def fake_run(argv, input, stdout, text):
+        shown["line"] = input
+        return SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+    pick._fzf_select([paper])
+
+    assert shown["line"].split("\t")[1:3] == ["----", "Automated decision aids"]

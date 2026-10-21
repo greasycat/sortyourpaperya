@@ -851,15 +851,18 @@ def _fzf_select(papers: Sequence[Paper]) -> list[Paper]:
     `knuth 84` is how a document is remembered when its title is not. Everything
     after the id is one searchable haystack -- fzf matches across the whole
     line, so the order of the columns is a reading decision and nothing more.
+    The title comes right after the year because it is what tells documents
+    apart: led by a long author list, three papers by the same group read as
+    three identical lines once the terminal cut them off.
     """
     lines = "\n".join(
         "\t".join(
             (
                 paper.file_id,
                 str(paper.year or "----"),
+                label(paper),
                 ", ".join(paper.authors) or "-",
                 " / ".join(paper.tags) or "-",
-                label(paper),
             )
         )
         for paper in papers
