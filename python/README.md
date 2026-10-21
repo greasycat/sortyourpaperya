@@ -1110,7 +1110,9 @@ edit and comes back after -- or in the desktop's viewer when neither is set. `n`
 (or Enter on the last line) asks for a name and starts a note, named the way
 `sypy note` names one: a bare word is markdown, blank is `notes.md`, and a note
 that already exists is opened, never overwritten. `h`, `q`, or Escape goes back
-to the tree. It is the tree only; fzf has no cursor to say which document.
+to the tree. In fzf, `p` at the operation prompt lists the notes of every
+document chosen -- each line names its document, with a `+ new note` per
+document -- and opens the one you pick the same way.
 
 `z` swaps the tree for `fzf` when it is installed: the same four operations
 over a flat list you type at rather than walk, which is what you want when you

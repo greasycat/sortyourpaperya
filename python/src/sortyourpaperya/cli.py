@@ -1584,7 +1584,8 @@ def pick(
     r moves everything selected to a category you type, and d deletes what is
     selected, after asking. p, on a document, lists its notes: enter opens one
     in $VISUAL or $EDITOR (or the desktop's viewer when neither is set), and n
-    starts a new one. q leaves without doing anything.
+    starts a new one; in fzf it lists the notes of every document chosen. q
+    leaves without doing anything.
 
     z swaps the tree for fzf, which is the same operations over a flat list you
     type at rather than walk -- what you want when you know the document's name
@@ -1632,12 +1633,12 @@ def pick(
         typer.echo("nothing to pick from" if not query else f"nothing matches {query!r}")
         return
     if fzf:
-        picker.fzf_round(load, on_apply)
+        picker.fzf_round(load, on_apply, reading)
         return
     # Back to the tree when fzf is done with: `z` is a way to find something,
     # not a way out of the picker.
     while picker.run(load, on_apply, reading) == "fzf":
-        picker.fzf_round(load, on_apply)
+        picker.fzf_round(load, on_apply, reading)
 
 
 def _interactive() -> bool:

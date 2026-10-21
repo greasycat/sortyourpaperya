@@ -887,9 +887,82 @@ def _fzf_select(papers: Sequence[Paper]) -> list[Paper]:
     return [by_id[found] for found in picked if found in by_id]
 
 
+def _fzf_note(rows: Sequence[tuple[Paper, Path | None]]) -> tuple[Paper, Path | None] | None:
+    """The note chosen in fzf -- or a document's `+ new note` line -- or None.
+
+    One line per note, and one `+ new note` per document, with the document's
+    name on every line: with several documents chosen, `ch3` alone would not
+    say whose. The row's index leads, hidden, so the choice is read back from
+    it rather than from a name two documents may share.
+    """
+    lines = "\n".join(
+        f"{index}\t{label(paper)}\t{path.name if path is not None else NEW_NOTE}"
+        for index, (paper, path) in enumerate(rows)
+    )
+    result = subprocess.run(
+        [
+            "fzf",
+            "--prompt", "notes> ",
+            "--delimiter", "\t",
+            "--with-nth", "2..",
+            "--height", "60%",
+            "--reverse",
+            "--header", f"enter opens a note; {NEW_NOTE} starts one",
+        ],
+        input=lines,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    index = result.stdout.split("\t", 1)[0].strip()
+    return rows[int(index)] if index.isdigit() and int(index) < len(rows) else None
+
+
+def fzf_notes(
+    papers: Sequence[Paper],
+    reading: Callable[[Callable[[Library], object]], object],
+    request: Callable[[str], str] = input,
+) -> str:
+    """Choose one of the chosen documents' notes in fzf, and open it.
+
+    The tree's `p` reads the document under the cursor; fzf has no cursor, so
+    this reads every chosen document and lists their notes together. Opening is
+    the same `_open_note` -- with no screen of our own, there is nothing to set
+    aside while the editor runs. A document missing from the store is named and
+    skipped rather than hiding the others' notes.
+    """
+    rows: list[tuple[Paper, Path | None]] = []
+    problems: list[str] = []
+    for paper in papers:
+        try:
+            menu = reading(lambda library, paper=paper: notes_menu(library, paper))
+        except (LibraryError, OSError) as err:
+            problems.append(f"{label(paper)}: {err}")
+            continue
+        rows += [(paper, path) for path in menu.notes] + [(paper, None)]
+
+    said = "\n".join(problems)
+    if not rows:
+        return said
+    chosen = _fzf_note(rows)
+    if chosen is None:
+        return said
+    paper, path = chosen
+    try:
+        if path is None:
+            typed = request("new note (blank for notes.md): ").strip()
+            path = reading(lambda library: new_note(library, paper, typed))
+        opened = _open_note(path, lambda job: job())
+    except (LibraryError, OSError) as err:
+        opened = f"{label(paper)}: {err}"
+    return "\n".join(filter(None, (said, opened)))
+
+
 def fzf_round(
     load: Callable[[], list[Node]],
     on_apply: Callable[[Operation, Sequence[Paper], str, "Node | None"], str],
+    reading: Callable[[Callable[[Library], object]], object] | None = None,
 ) -> None:
     """Choose in fzf, then do one thing to what was chosen.
 
@@ -909,9 +982,17 @@ def fzf_round(
     if not chosen:
         return
     keys = "  ".join(f"{op.key} {op.label}" for op in OPERATIONS)
+    if reading is not None:
+        keys += f"  {NOTES_KEY} notes"
     try:
         print(f"{len(chosen)} selected: {_names(chosen)}")
-        operation = operation_for(input(f"{keys}  (anything else quits): ").strip())
+        key = input(f"{keys}  (anything else quits): ").strip()
+        if key == NOTES_KEY and reading is not None:
+            said = fzf_notes(chosen, reading)
+            if said:
+                print(said)
+            return
+        operation = operation_for(key)
         if operation is None:
             return
         print(

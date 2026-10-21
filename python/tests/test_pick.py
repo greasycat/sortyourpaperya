@@ -837,3 +837,99 @@ def test_with_no_editor_a_note_goes_to_the_desktop(
     pick._open_note(note, lambda job: pytest.fail("no screen to set aside"))
 
     assert spawned == [[pick.viewer(), str(note)]]
+
+
+def _reading_from(library: Library):
+    return lambda job: job(library)
+
+
+def test_fzf_notes_lists_every_chosen_documents_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """fzf has no cursor, so every chosen document's notes are listed, named."""
+    library = Library(tmp_path / "lib")
+    _, chosen = _fill(library)
+    first = library.store_dir / chosen[0].store_name / "notes.md"
+    first.write_text("# First\n")
+    shown = {}
+
+    def fake_run(argv, input, stdout, text):
+        shown["argv"], shown["lines"] = argv, input.splitlines()
+        return SimpleNamespace(returncode=0, stdout=shown["lines"][0] + "\n")
+
+    opened = []
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+    monkeypatch.setattr(pick, "_open_note", lambda path, suspend: opened.append(path) or "ok")
+
+    said = pick.fzf_notes(chosen, _reading_from(library))
+
+    assert [line.split("\t", 1)[1] for line in shown["lines"]] == [
+        "First\tnotes.md",
+        f"First\t{pick.NEW_NOTE}",
+        f"Second\t{pick.NEW_NOTE}",
+    ]
+    assert "--multi" not in shown["argv"]  # one note is opened, not a batch
+    assert opened == [first] and said == "ok"
+
+
+def test_fzf_notes_starts_a_note_on_the_document_whose_line_was_chosen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    library = Library(tmp_path / "lib")
+    _, chosen = _fill(library)
+    monkeypatch.setattr(
+        pick.subprocess,
+        "run",
+        lambda argv, input, stdout, text: SimpleNamespace(
+            returncode=0, stdout=input.splitlines()[1] + "\n"
+        ),
+    )
+    opened = []
+    monkeypatch.setattr(pick, "_open_note", lambda path, suspend: opened.append(path) or "ok")
+
+    pick.fzf_notes(chosen, _reading_from(library), request=lambda prompt: "ch3")
+
+    assert opened == [library.store_dir / chosen[1].store_name / "ch3.md"]
+    assert opened[0].is_file()
+
+
+def test_fzf_notes_names_a_missing_document_and_lists_the_rest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    library = Library(tmp_path / "lib")
+    _, chosen = _fill(library)
+    (library.store_dir / chosen[0].store_name).rmdir()
+    seen = {}
+
+    def fake_run(argv, input, stdout, text):
+        seen["lines"] = input.splitlines()
+        return SimpleNamespace(returncode=130, stdout="")
+
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+
+    said = pick.fzf_notes(chosen, _reading_from(library))
+
+    assert len(seen["lines"]) == 1 and "Second" in seen["lines"][0]
+    assert "First" in said and "missing from the store" in said
+
+
+def test_p_at_the_fzf_prompt_goes_to_the_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    library = Library(tmp_path / "lib")
+    _fill(library)
+    papers = library.db.all_papers()
+    monkeypatch.setattr(pick, "_fzf_select", lambda _: papers[:2])
+    monkeypatch.setattr("builtins.input", lambda prompt="": pick.NOTES_KEY)
+    went = {}
+    monkeypatch.setattr(
+        pick, "fzf_notes", lambda chosen, reading: went.setdefault("chosen", chosen) and ""
+    )
+
+    pick.fzf_round(
+        lambda: pick.build_tree(papers),
+        lambda *a: pytest.fail("notes are not an operation"),
+        _reading_from(library),
+    )
+
+    assert went["chosen"] == papers[:2]
