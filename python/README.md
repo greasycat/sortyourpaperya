@@ -1103,6 +1103,17 @@ already knows what to do with a folder. The others act on the selection wherever
 the cursor happens to be, rather than opening the several hundred documents
 beneath a branch nobody asked for.
 
+`p` is not done to the selection: on the document under the cursor, it lists
+that document's notes with a `+ new note` line at the end. Enter opens the one
+under the cursor in `$VISUAL` or `$EDITOR` -- the picker steps aside while you
+edit and comes back after -- or in the desktop's viewer when neither is set. `n`
+(or Enter on the last line) asks for a name and starts a note, named the way
+`sypy note` names one: a bare word is markdown, blank is `notes.md`, and a note
+that already exists is opened, never overwritten. `h`, `q`, or Escape goes back
+to the tree. In fzf, `p` at the operation prompt lists the notes of every
+document chosen -- each line names its document, with a `+ new note` per
+document -- and opens the one you pick the same way.
+
 `z` swaps the tree for `fzf` when it is installed: the same four operations
 over a flat list you type at rather than walk, which is what you want when you
 know the document's name and not its shelf -- the year, the authors, the

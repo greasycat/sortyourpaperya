@@ -729,3 +729,257 @@ def test_a_command_gone_before_the_path_reports_its_status(
     monkeypatch.setattr(pick.subprocess, "Popen", lambda cmd, **kw: Process())
     with pytest.raises(LibraryError, match=said):
         pick._spawn("whatever", "/some/path")
+
+
+# ---- notes -----------------------------------------------------------------
+
+
+def test_the_notes_menu_lists_notes_then_offers_a_new_one(tmp_path: Path) -> None:
+    library = Library(tmp_path / "lib")
+    paper, _ = _fill(library)
+    folder = library.store_dir / paper.store_name
+    (folder / "notes.md").write_text("# Kept\n")
+    (folder / "reading-log.md").write_text("")
+
+    menu = pick.notes_menu(library, paper)
+
+    assert menu.rows == ["notes.md", "reading-log.md", pick.NEW_NOTE]
+    assert menu.handle("\n") == ("open", folder / "notes.md")
+    menu.handle("j")
+    assert menu.handle("l") == ("open", folder / "reading-log.md")
+    menu.handle("j")
+    menu.handle("j")  # stops on the last row
+    assert menu.handle("\r") == ("new", None)
+    assert menu.handle("n") == ("new", None)
+    for key in ("h", "q", "\x1b", pick.NOTES_KEY):
+        assert menu.handle(key) == ("back", None)
+
+
+def test_a_document_with_no_notes_offers_only_a_new_one(tmp_path: Path) -> None:
+    library = Library(tmp_path / "lib")
+    paper, _ = _fill(library)
+
+    menu = pick.notes_menu(library, paper)
+
+    assert menu.rows == [pick.NEW_NOTE]
+    assert menu.handle("\n") == ("new", None)
+
+
+def test_the_notes_menu_refuses_a_document_missing_from_the_store(tmp_path: Path) -> None:
+    """Starting a note there would make a folder the store does not account for."""
+    library = Library(tmp_path / "lib")
+    paper, _ = _fill(library)
+    (library.store_dir / paper.store_name).rmdir()
+
+    with pytest.raises(LibraryError, match="missing from the store"):
+        pick.notes_menu(library, paper)
+
+
+def test_a_new_note_is_named_like_sypy_note_and_never_overwritten(tmp_path: Path) -> None:
+    library = Library(tmp_path / "lib")
+    paper, _ = _fill(library)
+    folder = library.store_dir / paper.store_name
+
+    assert pick.new_note(library, paper, "") == folder / "notes.md"
+    made = pick.new_note(library, paper, "ch3")
+    assert made == folder / "ch3.md"
+    assert made.read_text().startswith("# Kept")
+
+    made.write_text("mine")
+    pick.new_note(library, paper, "ch3")
+    assert made.read_text() == "mine"
+
+    with pytest.raises(LibraryError):
+        pick.new_note(library, paper, "../escape")
+
+
+def test_the_editor_comes_from_visual_then_editor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
+    assert pick.editor() is None
+    monkeypatch.setenv("EDITOR", "code -w")
+    assert pick.editor() == ["code", "-w"]
+    monkeypatch.setenv("VISUAL", "nvim")
+    assert pick.editor() == ["nvim"]
+
+
+def test_the_footer_names_the_notes_key() -> None:
+    assert f"{pick.NOTES_KEY} notes" in pick.footer()
+
+
+def test_a_note_is_edited_with_the_screen_set_aside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The editor owns the terminal while it runs, so it runs inside `suspend`."""
+    note = tmp_path / "notes.md"
+    calls: list[object] = []
+    monkeypatch.setenv("VISUAL", "myeditor -w")
+    monkeypatch.setattr(pick.subprocess, "call", lambda cmd: calls.append(cmd) or 0)
+
+    def suspend(job):
+        calls.append("away")
+        job()
+        calls.append("back")
+
+    assert pick._open_note(note, suspend) == "edited notes.md"
+    assert calls == ["away", ["myeditor", "-w", str(note)], "back"]
+
+
+def test_with_no_editor_a_note_goes_to_the_desktop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    note = tmp_path / "notes.md"
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(pick, "_spawn", lambda cmd: spawned.append(cmd))
+
+    pick._open_note(note, lambda job: pytest.fail("no screen to set aside"))
+
+    assert spawned == [[pick.viewer(), str(note)]]
+
+
+def _reading_from(library: Library):
+    return lambda job: job(library)
+
+
+def test_fzf_notes_lists_every_chosen_documents_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """fzf has no cursor, so every chosen document's notes are listed, named."""
+    library = Library(tmp_path / "lib")
+    _, chosen = _fill(library)
+    first = library.store_dir / chosen[0].store_name / "notes.md"
+    first.write_text("# First\n")
+    shown = {}
+
+    def fake_run(argv, input, stdout, text):
+        shown["argv"], shown["lines"] = argv, input.splitlines()
+        return SimpleNamespace(returncode=0, stdout=shown["lines"][0] + "\n")
+
+    opened = []
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+    monkeypatch.setattr(pick, "_open_note", lambda path, suspend: opened.append(path) or "ok")
+
+    said = pick.fzf_notes(chosen, _reading_from(library))
+
+    assert [line.split("\t", 1)[1] for line in shown["lines"]] == [
+        "notes.md    First",
+        f"{pick.NEW_NOTE}  First",
+        f"{pick.NEW_NOTE}  Second",
+    ]
+    assert "--multi" not in shown["argv"]  # one note is opened, not a batch
+    assert opened == [first] and said == "ok"
+
+
+def test_fzf_notes_leads_with_the_note_so_a_long_title_cannot_hide_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A title wider than the terminal pushed the note names off its edge,
+    and four notes read as four identical lines."""
+    library = Library(tmp_path / "lib")
+    _, chosen = _fill(library)
+    paper = chosen[0]
+    paper.title = "What Distinguishes Optimal Visual Searchers? " * 3
+    folder = library.store_dir / paper.store_name
+    for name in ("discussion.md", "methods.md"):
+        (folder / name).write_text("")
+    shown = {}
+
+    def fake_run(argv, input, stdout, text):
+        shown["lines"] = input.splitlines()
+        return SimpleNamespace(returncode=130, stdout="")
+
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+    pick.fzf_notes([paper], _reading_from(library))
+
+    shown_from = [line.split("\t", 1)[1] for line in shown["lines"]]
+    assert [line[:13] for line in shown_from] == [
+        "discussion.md", "methods.md   ", pick.NEW_NOTE + "   "
+    ]
+
+
+def test_fzf_notes_starts_a_note_on_the_document_whose_line_was_chosen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    library = Library(tmp_path / "lib")
+    _, chosen = _fill(library)
+    monkeypatch.setattr(
+        pick.subprocess,
+        "run",
+        lambda argv, input, stdout, text: SimpleNamespace(
+            returncode=0, stdout=input.splitlines()[1] + "\n"
+        ),
+    )
+    opened = []
+    monkeypatch.setattr(pick, "_open_note", lambda path, suspend: opened.append(path) or "ok")
+
+    pick.fzf_notes(chosen, _reading_from(library), request=lambda prompt: "ch3")
+
+    assert opened == [library.store_dir / chosen[1].store_name / "ch3.md"]
+    assert opened[0].is_file()
+
+
+def test_fzf_notes_names_a_missing_document_and_lists_the_rest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    library = Library(tmp_path / "lib")
+    _, chosen = _fill(library)
+    (library.store_dir / chosen[0].store_name).rmdir()
+    seen = {}
+
+    def fake_run(argv, input, stdout, text):
+        seen["lines"] = input.splitlines()
+        return SimpleNamespace(returncode=130, stdout="")
+
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+
+    said = pick.fzf_notes(chosen, _reading_from(library))
+
+    assert len(seen["lines"]) == 1 and "Second" in seen["lines"][0]
+    assert "First" in said and "missing from the store" in said
+
+
+def test_p_at_the_fzf_prompt_goes_to_the_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    library = Library(tmp_path / "lib")
+    _fill(library)
+    papers = library.db.all_papers()
+    monkeypatch.setattr(pick, "_fzf_select", lambda _: papers[:2])
+    monkeypatch.setattr("builtins.input", lambda prompt="": pick.NOTES_KEY)
+    went = {}
+    monkeypatch.setattr(
+        pick, "fzf_notes", lambda chosen, reading: went.setdefault("chosen", chosen) and ""
+    )
+
+    pick.fzf_round(
+        lambda: pick.build_tree(papers),
+        lambda *a: pytest.fail("notes are not an operation"),
+        _reading_from(library),
+    )
+
+    assert went["chosen"] == papers[:2]
+
+
+def test_the_title_comes_before_the_authors_in_fzf(monkeypatch) -> None:
+    """Three papers by one group, led by the author list, were cut off by the
+    terminal before anything told them apart."""
+    paper = Paper(
+        file_id="abc123",
+        content_hash="h",
+        store_name="abc123__Psychology",
+        title="Automated decision aids",
+        authors=["Luke Strickland", "Russell J. Boag", "Andrew Heathcote"],
+        tags=["Psychology"],
+    )
+    shown = {}
+
+    def fake_run(argv, input, stdout, text):
+        shown["line"] = input
+        return SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+    pick._fzf_select([paper])
+
+    assert shown["line"].split("\t")[1:3] == ["----", "Automated decision aids"]
