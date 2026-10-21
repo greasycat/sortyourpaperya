@@ -864,12 +864,39 @@ def test_fzf_notes_lists_every_chosen_documents_notes(
     said = pick.fzf_notes(chosen, _reading_from(library))
 
     assert [line.split("\t", 1)[1] for line in shown["lines"]] == [
-        "First\tnotes.md",
-        f"First\t{pick.NEW_NOTE}",
-        f"Second\t{pick.NEW_NOTE}",
+        "notes.md    First",
+        f"{pick.NEW_NOTE}  First",
+        f"{pick.NEW_NOTE}  Second",
     ]
     assert "--multi" not in shown["argv"]  # one note is opened, not a batch
     assert opened == [first] and said == "ok"
+
+
+def test_fzf_notes_leads_with_the_note_so_a_long_title_cannot_hide_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A title wider than the terminal pushed the note names off its edge,
+    and four notes read as four identical lines."""
+    library = Library(tmp_path / "lib")
+    _, chosen = _fill(library)
+    paper = chosen[0]
+    paper.title = "What Distinguishes Optimal Visual Searchers? " * 3
+    folder = library.store_dir / paper.store_name
+    for name in ("discussion.md", "methods.md"):
+        (folder / name).write_text("")
+    shown = {}
+
+    def fake_run(argv, input, stdout, text):
+        shown["lines"] = input.splitlines()
+        return SimpleNamespace(returncode=130, stdout="")
+
+    monkeypatch.setattr(pick.subprocess, "run", fake_run)
+    pick.fzf_notes([paper], _reading_from(library))
+
+    shown_from = [line.split("\t", 1)[1] for line in shown["lines"]]
+    assert [line[:13] for line in shown_from] == [
+        "discussion.md", "methods.md   ", pick.NEW_NOTE + "   "
+    ]
 
 
 def test_fzf_notes_starts_a_note_on_the_document_whose_line_was_chosen(

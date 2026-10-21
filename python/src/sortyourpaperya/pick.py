@@ -891,13 +891,18 @@ def _fzf_note(rows: Sequence[tuple[Paper, Path | None]]) -> tuple[Paper, Path | 
     """The note chosen in fzf -- or a document's `+ new note` line -- or None.
 
     One line per note, and one `+ new note` per document, with the document's
-    name on every line: with several documents chosen, `ch3` alone would not
-    say whose. The row's index leads, hidden, so the choice is read back from
+    name after the note's on every line: with several documents chosen, `ch3`
+    alone would not say whose. The row's index leads, hidden, so the choice is read back from
     it rather than from a name two documents may share.
     """
+    names = [path.name if path is not None else NEW_NOTE for _, path in rows]
+    # The note first and padded to one width, the document after: a title runs
+    # long, and leading with it pushed every note's name off the right edge of
+    # the terminal, leaving lines that all read the same.
+    width = max(map(len, names))
     lines = "\n".join(
-        f"{index}\t{label(paper)}\t{path.name if path is not None else NEW_NOTE}"
-        for index, (paper, path) in enumerate(rows)
+        f"{index}\t{name:<{width}}  {label(paper)}"
+        for index, ((paper, _), name) in enumerate(zip(rows, names))
     )
     result = subprocess.run(
         [
