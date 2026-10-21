@@ -1582,7 +1582,9 @@ def pick(
     selected in whatever the desktop uses for it, O opens it with a command you
     type (the path is piped in) or, on a category, opens that branch's folder,
     r moves everything selected to a category you type, and d deletes what is
-    selected, after asking. q leaves without doing anything.
+    selected, after asking. p, on a document, lists its notes: enter opens one
+    in $VISUAL or $EDITOR (or the desktop's viewer when neither is set), and n
+    starts a new one. q leaves without doing anything.
 
     z swaps the tree for fzf, which is the same operations over a flat list you
     type at rather than walk -- what you want when you know the document's name
@@ -1616,6 +1618,12 @@ def pick(
             outcome = picker.apply(operation, library, chosen, answer, category)
             return outcome.describe(operation)
 
+    def reading(job):
+        # Notes are found and started by the reading route, as `note` does:
+        # they are files beside the document, and need no write lock.
+        with _reading(settings.output_dir) as library:
+            return job(library)
+
     if fzf and not picker.fzf_ready():
         typer.echo("error: --fzf needs fzf on PATH", err=True)
         raise typer.Exit(code=2)
@@ -1628,7 +1636,7 @@ def pick(
         return
     # Back to the tree when fzf is done with: `z` is a way to find something,
     # not a way out of the picker.
-    while picker.run(load, on_apply) == "fzf":
+    while picker.run(load, on_apply, reading) == "fzf":
         picker.fzf_round(load, on_apply)
 
 

@@ -7,7 +7,10 @@ deliberately holds no rule worth testing -- because it is the half a test cannot
 reach.
 
 Adding an operation is an entry in `OPERATIONS`. The screen reads its footer and
-its key bindings from there, so nothing in the drawing half changes.
+its key bindings from there, so nothing in the drawing half changes. Notes are
+the exception, and a deliberate one: they are read one document at a time, so
+`p` opens a menu of the document under the cursor rather than acting on the
+selection.
 """
 
 from __future__ import annotations
@@ -19,8 +22,10 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+from . import notes
 from .db import Paper
 from .library import Library, LibraryError
 from .naming import split_category
@@ -470,6 +475,80 @@ def apply(
     return outcome
 
 
+# ---- notes -----------------------------------------------------------------
+#
+# Not an Operation: an operation is done to a selection, and notes are read one
+# document at a time -- the one under the cursor. `p` opens a menu of that
+# document's notes, and choosing one hands it to an editor.
+
+NOTES_KEY = "p"
+
+# The menu's last line, which makes a note rather than opening one.
+NEW_NOTE = "+ new note"
+
+
+@dataclass
+class NotesMenu:
+    """One document's notes, a cursor over them, and a way to start another."""
+
+    paper: Paper
+    notes: list[Path]
+    cursor: int = 0
+
+    @property
+    def rows(self) -> list[str]:
+        return [path.name for path in self.notes] + [NEW_NOTE]
+
+    def handle(self, key: str) -> tuple[str, Path | None] | None:
+        """Apply one keystroke. Returns what to do when the key decides it.
+
+        `("open", path)` to open a note, `("new", None)` to ask for a name and
+        make one, `("back", None)` to return to the tree.
+        """
+        if key in DOWN_KEYS:
+            self.cursor = min(self.cursor + 1, len(self.rows) - 1)
+        elif key in UP_KEYS:
+            self.cursor = max(self.cursor - 1, 0)
+        elif key in OPEN_KEYS:
+            if self.cursor < len(self.notes):
+                return ("open", self.notes[self.cursor])
+            return ("new", None)
+        elif key == "n":
+            return ("new", None)
+        elif key in QUIT_KEYS or key in CLOSE_KEYS or key == NOTES_KEY:
+            return ("back", None)
+        return None
+
+
+def notes_menu(library: Library, paper: Paper) -> NotesMenu:
+    """The menu for one document, refusing one whose folder has gone.
+
+    A row without its folder is what `fsck` is for; offering to start a note
+    there would make a folder the store does not account for.
+    """
+    if not library.document_dir(paper).is_dir():
+        raise LibraryError(f"{paper.store_name} is missing from the store")
+    return NotesMenu(paper=paper, notes=library.notes(paper))
+
+
+def new_note(library: Library, paper: Paper, name: str) -> Path:
+    """Start a note by name -- `notes.md` when none is given -- and say where.
+
+    The same naming rules `sortyourpaperya note` uses, because it is the same
+    call: a bare word is markdown, and an existing note of that name is opened
+    rather than overwritten.
+    """
+    path = library.note_path(paper, name) if name else library.note_path(paper)
+    notes.create(path, label(paper))
+    return path
+
+
+def editor() -> list[str] | None:
+    """The command `$VISUAL` or `$EDITOR` names, split so `code -w` works."""
+    command = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    return command.split() if command else None
+
+
 # ---- the screen ------------------------------------------------------------
 #
 # Everything below draws the model above and maps keys onto it. It holds no rule
@@ -501,7 +580,10 @@ def footer() -> str:
     """The key legend, built from the registry so a new operation appears in it."""
     operations = "  ".join(f"{op.key} {op.label}" for op in OPERATIONS)
     fzf = f"  {FZF_KEY} fzf" if fzf_ready() else ""
-    return f"j/k move  space select  a all  A none  {operations}{fzf}  q quit"
+    return (
+        f"j/k move  space select  a all  A none  {operations}  {NOTES_KEY} notes"
+        f"{fzf}  q quit"
+    )
 
 
 class Screen:
@@ -662,6 +744,85 @@ def _read_line(fd: int, show: Callable[[object], None], prompt: str) -> str | No
             typed += key
 
 
+def _notes_view(menu: NotesMenu, height: int):
+    """One document's notes, the way the tree draws its rows."""
+    from rich.text import Text
+
+    out = Text(f"notes on {label(menu.paper)}\n", style="bold")
+    rows = menu.rows
+    body = max(1, min(len(rows), height - 3))
+    top = max(0, min(menu.cursor - body // 2, max(0, len(rows) - body)))
+    for index in range(top, min(top + body, len(rows))):
+        line = Text(f"  {rows[index]}", style="dim" if rows[index] == NEW_NOTE else "")
+        if index == menu.cursor:
+            line.stylize("reverse")
+        out.append_text(line)
+        out.append("\n")
+    out.append("j/k move  enter open  n new  h back", style="dim")
+    return out
+
+
+def _open_note(path: Path, suspend: Callable[[Callable[[], None]], None]) -> str:
+    """Hand a note to the editor, or to the desktop when there is none.
+
+    An editor wants the terminal, so the screen is set aside while it runs and
+    drawn again after -- `suspend` does both. A desktop viewer does not, and is
+    started and left like any other document.
+    """
+    command = editor()
+    if command is None:
+        _spawn([viewer(), str(path)])
+        return f"opened {path.name}"
+    failed: list[OSError] = []
+
+    def edit() -> None:
+        try:
+            subprocess.call([*command, str(path)])
+        except OSError as err:
+            failed.append(err)
+
+    suspend(edit)
+    if failed:
+        raise LibraryError(f"could not run {command[0]}: {failed[0]}")
+    return f"edited {path.name}"
+
+
+def _browse_notes(
+    paper: Paper,
+    fd: int,
+    show: Callable[[object], None],
+    height: Callable[[], int],
+    reading: Callable[[Callable[[Library], object]], object],
+    suspend: Callable[[Callable[[], None]], None],
+) -> str:
+    """Show one document's notes until one is opened or the menu is left.
+
+    Returns the line the tree shows afterwards.
+    """
+    name = label(paper)
+    try:
+        menu = reading(lambda library: notes_menu(library, paper))
+    except (LibraryError, OSError) as err:
+        return f"{name}: {err}"
+    while True:
+        show(_notes_view(menu, height()))
+        wanted = menu.handle(_read_key(fd))
+        if wanted is None:
+            continue
+        action, path = wanted
+        if action == "back":
+            return ""
+        try:
+            if action == "new":
+                typed = _read_line(fd, show, "new note (blank for notes.md): ")
+                if typed is None:
+                    continue
+                path = reading(lambda library: new_note(library, paper, typed.strip()))
+            return _open_note(path, suspend)
+        except (LibraryError, OSError) as err:
+            return f"{name}: {err}"
+
+
 # ---- fzf ------------------------------------------------------------------
 #
 # A second way to make the selection, for when you know what you are looking
@@ -769,6 +930,7 @@ def fzf_round(
 def run(
     load: Callable[[], list[Node]],
     on_apply: Callable[[Operation, Sequence[Paper], str, "Node | None"], str],
+    reading: Callable[[Callable[[Library], object]], object],
 ) -> str | None:
     """Show the tree until asked to stop. Returns "fzf" when asked for fzf.
 
@@ -776,7 +938,8 @@ def run(
     wants the terminal to itself, and the caller is where it can have it.
 
     `on_apply` performs an operation and returns the line to show afterwards,
-    and `load` re-reads the tree. Both are passed in rather than imported:
+    `load` re-reads the tree, and `reading` runs a job against the library by
+    the reading route, which is how a document's notes are found and started. Both are passed in rather than imported:
     applying needs a library, and how the library is reached -- directly, or
     through the watcher holding the write lock -- is the caller's business, not
     this screen's.
@@ -805,11 +968,36 @@ def run(
             def show(renderable) -> None:
                 live.update(renderable, refresh=True)
 
+            def suspend(job: Callable[[], None]) -> None:
+                # The terminal goes back the way the shell left it while the
+                # job has it, and comes back to the picker afterwards.
+                live.stop()
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                try:
+                    job()
+                finally:
+                    tty.setcbreak(fd)
+                    live.start()
+
             while True:
                 show(_view(screen, console.size.height))
                 key = _read_key(fd)
                 if key in QUIT_KEYS:
                     break
+                if key == NOTES_KEY:
+                    here = screen.under_cursor()
+                    if here is None or not here.is_document:
+                        screen.message = "p opens one document's notes; move onto one"
+                        continue
+                    screen.message = _browse_notes(
+                        here.paper,
+                        fd,
+                        show,
+                        lambda: console.size.height,
+                        reading,
+                        suspend,
+                    )
+                    continue
                 if key == FZF_KEY:
                     if fzf_ready():
                         leaving = "fzf"
